@@ -1,0 +1,18 @@
+[package]
+name = "distant-horizons-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pumpkin-plugin-api = { path = "../pumpkin-plugin-api" }
+tracing = "0.1"
+
+[profile.release]
+lto = true
+
+# Keep this crate out of the Pumpkin workspace so it builds independently
+# for the wasm32-wasip2 target.
+[workspace]
