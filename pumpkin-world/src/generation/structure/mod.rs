@@ -13,7 +13,8 @@ use crate::{
             StructureGenerator, StructureGeneratorContext, StructurePosition,
             buried_treasure::BuriedTreasureGenerator, create_chunk_random,
             desert_pyramid::DesertPyramidGenerator, igloo::IglooGenerator, jigsaw::JigsawGenerator,
-            jungle_temple::JungleTempleGenerator, nether_fortress::NetherFortressGenerator,
+            jungle_temple::JungleTempleGenerator, mineshaft::{MineshaftGenerator, MineshaftType},
+            nether_fortress::NetherFortressGenerator,
             nether_fossil::NetherFossilGenerator, stronghold::StrongholdGenerator,
             swamp_hut::SwampHutGenerator,
         },
@@ -65,6 +66,14 @@ pub fn try_generate_structure(
         StructureKeys::Igloo => IglooGenerator::get_structure_position(&IglooGenerator, context),
         StructureKeys::DesertPyramid => DesertPyramidGenerator.get_structure_position(context),
         StructureKeys::JunglePyramid => JungleTempleGenerator.get_structure_position(context),
+        StructureKeys::Mineshaft => MineshaftGenerator {
+            mineshaft_type: MineshaftType::Normal,
+        }
+        .get_structure_position(context),
+        StructureKeys::MineshaftMesa => MineshaftGenerator {
+            mineshaft_type: MineshaftType::Mesa,
+        }
+        .get_structure_position(context),
         StructureKeys::VillagePlains
         | StructureKeys::VillageDesert
         | StructureKeys::VillageSavanna
@@ -159,6 +168,14 @@ pub fn lazily_generate_structure(
         StructureKeys::Igloo => IglooGenerator::get_structure_position(&IglooGenerator, context),
         StructureKeys::DesertPyramid => DesertPyramidGenerator.get_structure_position(context),
         StructureKeys::JunglePyramid => JungleTempleGenerator.get_structure_position(context),
+        StructureKeys::Mineshaft => MineshaftGenerator {
+            mineshaft_type: MineshaftType::Normal,
+        }
+        .get_structure_position(context),
+        StructureKeys::MineshaftMesa => MineshaftGenerator {
+            mineshaft_type: MineshaftType::Mesa,
+        }
+        .get_structure_position(context),
         StructureKeys::VillagePlains
         | StructureKeys::VillageDesert
         | StructureKeys::VillageSavanna

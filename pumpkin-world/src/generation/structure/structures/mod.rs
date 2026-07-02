@@ -27,6 +27,7 @@ pub mod igloo;
 pub mod jigsaw;
 pub mod jigsaw_placement;
 pub mod jungle_temple;
+pub mod mineshaft;
 pub mod nether_fortress;
 pub mod nether_fossil;
 pub mod stronghold;
