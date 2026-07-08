@@ -1,3 +1,4 @@
+use pumpkin_data::damage::DamageType;
 use pumpkin_util::math::vector3::Vector3;
 use std::{
     f64,
@@ -9,8 +10,10 @@ use std::{
 
 use crate::{
     entity::{
-        Entity, EntityBase, EntityBaseFuture, NBTStorage, living::LivingEntity,
-        projectile::ThrownItemEntity, projectile_deflection::ProjectileDeflectionType,
+        Entity, EntityBase, EntityBaseFuture, NBTStorage,
+        living::LivingEntity,
+        projectile::{ProjectileHit, ThrownItemEntity},
+        projectile_deflection::ProjectileDeflectionType,
     },
     server::Server,
 };
@@ -30,7 +33,7 @@ enum WindChargeKind {
 
 pub struct WindChargeEntity {
     kind: WindChargeKind,
-    thrown_item_entity: ThrownItemEntity,
+    pub thrown_item_entity: ThrownItemEntity,
 }
 
 impl WindChargeEntity {
@@ -129,5 +132,32 @@ impl EntityBase for WindChargeEntity {
 
     fn cast_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn on_hit(&self, hit: ProjectileHit) -> EntityBaseFuture<'_, ()> {
+        Box::pin(async move {
+            let hit_pos = hit.hit_pos();
+
+            match hit {
+                ProjectileHit::Entity { ref entity, .. } => {
+                    let entity_clone = entity.clone();
+                    let pos = hit_pos;
+
+                    // Create explosion for knockback
+                    self.create_explosion(pos).await;
+
+                    // Deal damage to the hit entity
+                    tokio::spawn(async move {
+                        let _ = entity_clone
+                            .damage(entity_clone.as_ref(), 1.0, DamageType::WIND_CHARGE)
+                            .await;
+                    });
+                }
+                ProjectileHit::Block { .. } => {
+                    // Create explosion for redstone activation + entity knockback
+                    self.create_explosion(hit_pos).await;
+                }
+            }
+        })
     }
 }

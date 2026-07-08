@@ -38,6 +38,8 @@ pub mod shulker_box;
 pub mod sign;
 pub mod smoker;
 pub mod trapped_chest;
+pub mod trial_spawner;
+pub mod vault;
 
 pub use furnace_like_block_entity::ExperienceContainer;
 pub use pumpkin_world::block::entities::PropertyDelegate;
@@ -230,6 +232,10 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>> 
         lectern::LecternBlockEntity::ID => {
             Some(Arc::new(lectern::LecternBlockEntity::from_nbt(nbt, pos)))
         }
+        trial_spawner::TrialSpawnerBlockEntity::ID => Some(Arc::new(
+            trial_spawner::TrialSpawnerBlockEntity::from_nbt(nbt, pos),
+        )),
+        vault::VaultBlockEntity::ID => Some(Arc::new(vault::VaultBlockEntity::from_nbt(nbt, pos))),
         _ => None,
     }
 }

@@ -102,6 +102,8 @@ pub mod tnt;
 
 pub mod coral;
 pub mod decorated_pot;
+pub mod trial_spawner;
+pub mod vault;
 
 // Misc / abstract
 pub mod abstract_wall_mounting;

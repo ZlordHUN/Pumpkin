@@ -125,6 +125,8 @@ use crate::block::blocks::suspicious::SuspiciousSandBlock;
 use crate::block::blocks::tnt::TNTBlock;
 use crate::block::blocks::torches::TorchBlock;
 use crate::block::blocks::trapdoor::TrapDoorBlock;
+use crate::block::blocks::trial_spawner::TrialSpawnerBlock;
+use crate::block::blocks::vault::VaultBlock;
 use crate::block::blocks::vine::VineBlock;
 use crate::block::blocks::walls::WallBlock;
 use crate::block::blocks::wither_skull::WitherSkeletonSkullBlock;
@@ -312,6 +314,8 @@ pub fn default_registry() -> Arc<BlockRegistry> {
 
     manager.register(FallingBlock);
     manager.register(SuspiciousSandBlock);
+    manager.register(TrialSpawnerBlock);
+    manager.register(VaultBlock);
 
     // Fire
     manager.register(SoulFireBlock);
