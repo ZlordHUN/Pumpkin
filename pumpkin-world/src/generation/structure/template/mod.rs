@@ -25,7 +25,7 @@
 //! ```
 
 mod block_state_resolver;
-mod cache;
+pub mod cache;
 pub mod processor;
 mod structure_template;
 mod template_piece;

@@ -31,6 +31,7 @@ pub mod nether_fortress;
 pub mod nether_fossil;
 pub mod stronghold;
 pub mod swamp_hut;
+pub mod woodland_mansion;
 
 pub trait BlockRandomizer {
     fn get_block(&self, rng: &mut RandomGenerator, is_border: bool) -> &BlockState;

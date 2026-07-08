@@ -15,7 +15,7 @@ use crate::{
             desert_pyramid::DesertPyramidGenerator, igloo::IglooGenerator, jigsaw::JigsawGenerator,
             jungle_temple::JungleTempleGenerator, nether_fortress::NetherFortressGenerator,
             nether_fossil::NetherFossilGenerator, stronghold::StrongholdGenerator,
-            swamp_hut::SwampHutGenerator,
+            swamp_hut::SwampHutGenerator, woodland_mansion::WoodlandMansionGenerator,
         },
     },
 };
@@ -94,6 +94,7 @@ pub fn try_generate_structure(
             }
             generator.get_structure_position(context)
         }
+        StructureKeys::Mansion => WoodlandMansionGenerator.get_structure_position(context),
         // TODO: Implement other structure types
         _ => None,
     };
@@ -180,6 +181,7 @@ pub fn lazily_generate_structure(
             }
             generator.get_structure_position(context)
         }
+        StructureKeys::Mansion => WoodlandMansionGenerator.get_structure_position(context),
         // TODO: Implement other structure types
         _ => None,
     };
