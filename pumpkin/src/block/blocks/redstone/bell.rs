@@ -21,7 +21,7 @@ use pumpkin_macros::pumpkin_block;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::world::BlockFlags;
 
-fn ring_bell(position: BlockPos, world: &Arc<World>, hit_direction: Option<HorizontalFacing>) {
+pub fn ring_bell(position: BlockPos, world: &Arc<World>, hit_direction: Option<HorizontalFacing>) {
     let (block, state_id) = world.get_block_and_state_id(&position);
 
     let props = BellLikeProperties::from_state_id(state_id, block);

@@ -69,6 +69,7 @@ pub enum WorldEvent {
     SoundPhantomBite = 1039u16,
     SoundPlayJukeboxSong = 1010u16,
     SoundPointedDripstoneLand = 1045u16,
+    SoundRaidHorn = 1037u16,
     SoundPortalTravel = 1032u16,
     SoundSkeletonToStray = 1048u16,
     SoundSmithingTableUsed = 1044u16,

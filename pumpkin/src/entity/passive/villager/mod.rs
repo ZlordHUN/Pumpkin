@@ -29,11 +29,14 @@ use crate::entity::player::Player;
 use crate::entity::{
     Entity, EntityBase, NBTStorage,
     ai::goal::{
-        avoid_entity::AvoidEntityGoal, look_around::RandomLookAroundGoal,
+        avoid_entity::AvoidEntityGoal, breed::BreedGoal, look_around::RandomLookAroundGoal,
         look_at_entity::LookAtEntityGoal, swim::SwimGoal, wander_around::WanderAroundGoal,
     },
     mob::{Mob, MobEntity},
 };
+use pumpkin_data::particle::Particle;
+use pumpkin_data::sound::SoundCategory;
+use rand::RngExt;
 
 pub mod data;
 pub use data::{
@@ -141,17 +144,19 @@ impl VillagerEntity {
                 Box::new(AvoidEntityGoal::new(&EntityType::VEX, 12.0, 0.5, 0.5)),
             );
 
+            // Breeding (villagers breed when willing from having enough food)
+            goal_selector.add_goal(2, BreedGoal::new(0.5));
             // Basic movement and looking (Vanilla uses 0.5 speed)
-            goal_selector.add_goal(2, Box::new(WanderAroundGoal::new(0.5)));
+            goal_selector.add_goal(3, Box::new(WanderAroundGoal::new(0.5)));
             goal_selector.add_goal(
-                3,
+                4,
                 LookAtEntityGoal::with_default(mob_weak.clone(), &EntityType::PLAYER, 8.0),
             );
             goal_selector.add_goal(
-                4,
+                5,
                 LookAtEntityGoal::with_default(mob_weak, &EntityType::VILLAGER, 8.0),
             );
-            goal_selector.add_goal(5, Box::new(RandomLookAroundGoal::default()));
+            goal_selector.add_goal(6, Box::new(RandomLookAroundGoal::default()));
         };
 
         // Send initial metadata
@@ -297,6 +302,155 @@ impl VillagerEntity {
                 .await;
         }
     }
+
+    /// Adds a gossip entry about the given player.
+    pub async fn add_gossip(&self, target: Uuid, gossip_type: GossipType, value: i32) {
+        let mut gossips = self.gossips.lock().await;
+        let entry = gossips.entry(target).or_default();
+        let current = entry.entry(gossip_type).or_insert(0);
+        *current = (*current).max(value).min(gossip_type.max_value());
+    }
+
+    /// Decays all gossip values. Called once per second (every 20 ticks).
+    async fn decay_gossip(&self) {
+        let mut gossips = self.gossips.lock().await;
+        let mut empty_targets = Vec::new();
+
+        for (target, types) in gossips.iter_mut() {
+            let mut empty_types = Vec::new();
+            for (&gtype, value) in types.iter_mut() {
+                let decay = gtype.decay_amount();
+                *value -= decay;
+                if *value <= 0 {
+                    empty_types.push(gtype);
+                }
+            }
+            for gtype in empty_types {
+                types.remove(&gtype);
+            }
+            if types.is_empty() {
+                empty_targets.push(*target);
+            }
+        }
+
+        for target in empty_targets {
+            gossips.remove(&target);
+        }
+    }
+
+    /// Shares one random gossip entry with a nearby villager.
+    async fn share_gossip_with_nearby(&self, world: &crate::world::World) {
+        let gossips = self.gossips.lock().await;
+        if gossips.is_empty() {
+            return;
+        }
+
+        // Collect all gossip entries as flat list
+        let mut all_entries: Vec<(Uuid, GossipType, i32)> = Vec::new();
+        for (target, types) in gossips.iter() {
+            for (&gtype, &value) in types.iter() {
+                if gtype.can_be_shared() {
+                    all_entries.push((*target, gtype, value));
+                }
+            }
+        }
+        drop(gossips);
+
+        if all_entries.is_empty() {
+            return;
+        }
+
+        // Pick a random entry to share
+        let idx = rand::rng().random_range(0..all_entries.len());
+        let (target_uuid, gtype, value) = all_entries[idx];
+
+        // Find a nearby villager to share with (within 10 blocks)
+        let pos = self.get_entity().pos.load();
+        let nearby = world.get_nearby_entities(pos, 10.0);
+
+        for candidate in nearby.values() {
+            if candidate.get_entity().entity_id == self.get_entity().entity_id {
+                continue;
+            }
+            if candidate.get_entity().entity_type != &pumpkin_data::entity::EntityType::VILLAGER {
+                continue;
+            }
+
+            // Cast to VillagerEntity to access gossip methods
+            if let Some(villager) = candidate.cast_any().downcast_ref::<VillagerEntity>() {
+                villager.add_gossip(target_uuid, gtype, value).await;
+                break; // Only share with one villager per cycle
+            }
+        }
+    }
+
+    /// Tries to restock trades at the job site during work hours.
+    /// Villagers can restock up to twice per Minecraft day.
+    async fn try_restock(&self, world: &crate::world::World) {
+        let level_time = world.level_time.lock().await;
+        let time = level_time.time_of_day;
+        let world_time = level_time.world_age;
+        drop(level_time);
+
+        // Work hours are 2000-9000 (morning to afternoon)
+        if time < 2000 || time > 9000 {
+            return;
+        }
+
+        let restocks_today = self.restocks_today.load(Ordering::Relaxed);
+
+        // Reset restocks count at start of a new day (time just past midnight)
+        if time < 100 {
+            self.restocks_today.store(0, Ordering::Relaxed);
+            return;
+        }
+
+        if restocks_today >= 2 {
+            return;
+        }
+
+        let Some(job_site) = self.get_job_site() else {
+            return;
+        };
+
+        // Check if the villager is near the job site (within 2 blocks)
+        let pos = self.get_entity().pos.load();
+        let dist = job_site.to_f64().squared_distance_to_vec(&pos);
+        if dist > 4.0 {
+            return;
+        }
+
+        // Ensure at least 20 seconds (400 ticks) between restocks
+        let last = self.last_restock_time.load(Ordering::Relaxed);
+        if world_time - last < 400 {
+            return;
+        }
+
+        // Restock: reset uses on all trade offers
+        let mut offers = self.offers.lock().await;
+        for offer in offers.iter_mut() {
+            offer.uses = 0;
+            offer.is_disabled = false;
+        }
+
+        self.restocks_today.fetch_add(1, Ordering::Relaxed);
+        self.last_restock_time.store(world_time, Ordering::Relaxed);
+
+        // Play profession-specific work sound and spawn particles
+        let entity = &self.mob_entity.living_entity.entity;
+        let pos = entity.pos.load();
+        let profession = self.villager_data.lock().await.profession_enum();
+        if let Some(work_sound) = profession.work_sound() {
+            world.play_sound(work_sound, SoundCategory::Neutral, &pos);
+        }
+        world.spawn_particle(
+            pos + Vector3::new(0.0, f64::from(entity.height()), 0.0),
+            Vector3::new(0.3, 0.3, 0.3),
+            1.0,
+            5,
+            Particle::HappyVillager,
+        );
+    }
 }
 
 impl ScreenHandlerFactory for VillagerEntity {
@@ -371,6 +525,11 @@ impl ScreenHandlerFactory for VillagerEntity {
                                 } else {
                                     drop(data);
                                 }
+
+                                // Add trading gossip for the player
+                                villager
+                                    .add_gossip(player_uuid, GossipType::Trading, 2)
+                                    .await;
 
                                 let current_level = villager.villager_data.lock().await.level;
                                 player
@@ -885,9 +1044,43 @@ impl Mob for VillagerEntity {
                 }
             }
 
-            // 2. Job / Profession logic (skip for Nitwits and babies)
-            let data = self.villager_data.lock().await;
+            // 2. Food, breeding, gossip (for all adult villagers, including Nitwits)
             let is_adult = self.get_entity().age.load(Ordering::Relaxed) >= 0;
+
+            if is_adult {
+                // Eat food from inventory to fill food level
+                self.eat_until_full().await;
+
+                // If the villager has enough food, become willing to breed
+                if self.food_level.load(Ordering::Relaxed) >= BREEDING_FOOD_THRESHOLD
+                    && self.mob_entity.is_breeding_ready()
+                    && !self.mob_entity.is_in_love()
+                {
+                    self.food_level
+                        .fetch_sub(BREEDING_FOOD_THRESHOLD, Ordering::Relaxed);
+                    self.mob_entity.set_love_ticks(600, None);
+
+                    // Spawn heart particles to show willingness
+                    let entity = &self.mob_entity.living_entity.entity;
+                    let pos = entity.pos.load();
+                    world.spawn_particle(
+                        pos + Vector3::new(0.0, f64::from(entity.height()), 0.0),
+                        Vector3::new(0.5, 0.5, 0.5),
+                        1.0,
+                        7,
+                        Particle::Heart,
+                    );
+                }
+
+                // Gossip: decay all existing gossip values
+                self.decay_gossip().await;
+
+                // Gossip: share a random gossip entry with a nearby villager
+                self.share_gossip_with_nearby(&world).await;
+            }
+
+            // 3. Job / Profession logic (skip for Nitwits and babies)
+            let data = self.villager_data.lock().await;
             let xp = self.xp.load(Ordering::Relaxed);
             let profession = data.profession_enum();
             drop(data);
@@ -996,19 +1189,74 @@ impl Mob for VillagerEntity {
                     }
                 }
             }
+
+            // 4. Restocking: during work hours, restock trades at the job site
+            self.try_restock(&world).await;
         })
     }
 
     fn mob_interact<'a>(
         &'a self,
         player: &'a Arc<Player>,
-        _item_stack: &'a mut pumpkin_data::item_stack::ItemStack,
+        item_stack: &'a mut pumpkin_data::item_stack::ItemStack,
     ) -> crate::entity::EntityBaseFuture<'a, bool> {
         let player = player.clone();
         Box::pin(async move {
+            // Babies just shake their head
             if self.get_entity().age.load(Ordering::Relaxed) < 0 {
                 self.set_unhappy();
                 return true;
+            }
+
+            // If the player is holding villager food, try to give it to the villager
+            let food_points = get_food_points(&item_stack.item);
+            if food_points > 0 && !item_stack.is_empty() {
+                let inventory = self.inventory.lock().await;
+                let item_id = item_stack.item.id;
+
+                // Try to stack with an existing slot of the same item
+                let mut added = false;
+                for slot_mutex in inventory.iter() {
+                    let mut slot = slot_mutex.lock().await;
+                    if !slot.is_empty()
+                        && slot.item.id == item_id
+                        && slot.item_count < slot.get_max_stack_size() as u8
+                    {
+                        slot.item_count += 1;
+                        added = true;
+                        break;
+                    }
+                }
+
+                // If no existing stack, find an empty slot
+                if !added {
+                    for slot_mutex in inventory.iter() {
+                        let mut slot = slot_mutex.lock().await;
+                        if slot.is_empty() {
+                            *slot = pumpkin_data::item_stack::ItemStack::new(1, item_stack.item);
+                            added = true;
+                            break;
+                        }
+                    }
+                }
+
+                if added {
+                    item_stack.decrement_unless_creative(player.gamemode.load(), 1);
+
+                    // Play pickup particles
+                    let entity = &self.mob_entity.living_entity.entity;
+                    let world = entity.world.load();
+                    let pos = entity.pos.load();
+                    world.spawn_particle(
+                        pos + Vector3::new(0.0, f64::from(entity.height()), 0.0),
+                        Vector3::new(0.3, 0.3, 0.3),
+                        1.0,
+                        7,
+                        Particle::HappyVillager,
+                    );
+                    return true;
+                }
+                // Inventory full, fall through to trading screen
             }
 
             let mut offers = self.offers.lock().await;

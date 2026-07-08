@@ -11,10 +11,11 @@ use pumpkin_protocol::bedrock::network_item::{
 };
 use pumpkin_protocol::codec::data_component::data_to_proto_sound;
 use pumpkin_world::generation::proto_chunk::GenerationCache;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::atomic::Ordering,
 };
 use tracing::{debug, error, info, trace, warn};
@@ -24,7 +25,9 @@ pub mod explosion;
 pub mod loot;
 pub mod map;
 pub mod portal;
+pub mod raid;
 pub mod time;
+pub mod village;
 
 use crate::block::RandomTickArgs;
 use crate::world::chunker::is_within_view_distance;
@@ -224,6 +227,15 @@ pub struct World {
     /// Block entities indexed by chunk, so ticking only visits the currently
     /// active chunks instead of scanning every loaded block entity each tick.
     pub block_entities: DashMap<Vector2<i32>, FxHashMap<BlockPos, Arc<dyn BlockEntity>>>,
+    /// Village manager — tracks groups of villagers, beds, and bells as villages.
+    /// Drives iron golem spawning, cat spawning, zombie sieges, and raid eligibility.
+    pub village_manager: Mutex<village::VillageManager>,
+    /// Raid manager — tracks all active pillager raids in this world.
+    pub raid_manager: Mutex<raid::RaidManager>,
+    /// Timer ticks until the next wandering trader spawn attempt.
+    pub wandering_trader_spawn_delay: AtomicI32,
+    /// How many wandering traders have been spawned so far.
+    pub wandering_trader_spawn_chance: AtomicI32,
 }
 
 impl PartialEq for World {
@@ -311,6 +323,10 @@ impl World {
             active_chunks: ArcSwap::new(Arc::new(FxHashSet::default())),
             server,
             block_entities: DashMap::new(),
+            village_manager: Mutex::new(village::VillageManager::default()),
+            raid_manager: Mutex::new(raid::RaidManager::default()),
+            wandering_trader_spawn_delay: AtomicI32::new(24000),
+            wandering_trader_spawn_chance: AtomicI32::new(25),
         }
     }
 
@@ -1117,7 +1133,7 @@ impl World {
         }
     }
 
-    async fn tick_environment(&self) {
+    async fn tick_environment(self: &Arc<Self>) {
         let (world_age, is_night, time_of_day) = {
             let mut level_time = self.level_time.lock().await;
             let (advance_time, advance_weather) = {
@@ -1181,6 +1197,138 @@ impl World {
         } else if world_age % 20 == 0 {
             let level_time = self.level_time.lock().await;
             level_time.send_time(self).await;
+        }
+
+        // ── Village system ──────────────────────────────────────────
+        // Rebuild villages every 20 ticks (1 second) to pick up
+        // bed/bell changes and villager movements.
+        if world_age % 20 == 0 {
+            self.rebuild_villages(is_night, time_of_day).await;
+        }
+
+        // ── Raid system ───────────────────────────────────────────
+        // Check for players with Raid Omen near villages periodically.
+        if world_age % i64::from(raid::RAID_OMEN_CHECK_INTERVAL) == 0 {
+            self.check_raid_triggers().await;
+        }
+        let world_seed = self.level.seed.0;
+        self.tick_raids(world_seed, world_age).await;
+
+        // ── Wandering trader spawning ────────────────────────────
+        // Vanilla: attempts to spawn a wandering trader every 24000 ticks,
+        // with a 2.5% base chance increasing over time.
+        self.tick_wandering_trader_spawning(world_age).await;
+    }
+
+    /// Rebuilds the village list by aggregating data from villager entities
+    /// (their positions, claimed beds, and adult status) and nearby bells.
+    /// Also triggers golem and cat spawning for eligible villages.
+    async fn rebuild_villages(self: &Arc<Self>, is_night: bool, time_of_day: i64) {
+        let is_midnight = time_of_day >= 18000 && time_of_day < 18020;
+        let entities = self.entities.load();
+        let active_chunks = self.active_chunks.load();
+        let world_seed = self.level.seed.0;
+        let world_age = self.level_time.lock().await.world_age;
+
+        let mut villager_snapshots: Vec<village::VillagerSnapshot> = Vec::new();
+
+        for entity in entities.iter() {
+            let e = entity.get_entity();
+            let pos = e.pos.load();
+            let chunk = Vector2::new((pos.x.floor() as i32) >> 4, (pos.z.floor() as i32) >> 4);
+            if !active_chunks.contains(&chunk) {
+                continue;
+            }
+            if e.entity_type == &EntityType::VILLAGER {
+                villager_snapshots.push(village::VillagerSnapshot {
+                    position: pos,
+                    home_pos: e.get_home_pos(),
+                    is_adult: e.age.load(Ordering::Relaxed) >= 0,
+                });
+            }
+        }
+
+        if villager_snapshots.is_empty() {
+            let mut vm = self.village_manager.lock().await;
+            vm.villages.clear();
+            return;
+        }
+
+        let search_radius = 48;
+        let mut bell_set: HashSet<BlockPos> = HashSet::default();
+        let mut candidates: Vec<BlockPos> = villager_snapshots
+            .iter()
+            .map(|s| {
+                BlockPos::new(
+                    s.position.x.floor() as i32,
+                    s.position.y.floor() as i32,
+                    s.position.z.floor() as i32,
+                )
+            })
+            .collect();
+        candidates.sort_by_key(|p| (p.0.x, p.0.y, p.0.z));
+        candidates.dedup();
+
+        for candidate in &candidates {
+            let min_x = candidate.0.x - search_radius;
+            let max_x = candidate.0.x + search_radius;
+            let min_y = (candidate.0.y - 8).max(self.min_y);
+            let max_y = (candidate.0.y + 8).min(self.min_y + 256);
+            let min_z = candidate.0.z - search_radius;
+            let max_z = candidate.0.z + search_radius;
+            for y in min_y..=max_y {
+                for x in (min_x..=max_x).step_by(4) {
+                    for z in (min_z..=max_z).step_by(4) {
+                        let pos = BlockPos::new(x, y, z);
+                        if !active_chunks.contains(&pos.chunk_position()) {
+                            continue;
+                        }
+                        if village::is_bell(self.get_block(&pos)) {
+                            bell_set.insert(pos);
+                        }
+                    }
+                }
+            }
+        }
+        let bell_positions: Vec<BlockPos> = bell_set.into_iter().collect();
+
+        let mut vm = self.village_manager.lock().await;
+        vm.rebuild(&villager_snapshots, &bell_positions);
+
+        // Golem spawning (timer-based, 600-tick cooldown)
+        let golem_timers = vm.tick_golem_spawn_timers();
+        for (vi, center) in golem_timers {
+            let world = self.clone();
+            if let Some(spawn_pos) = village::VillageManager::find_golem_spawn_position(
+                center,
+                world_seed,
+                world_age,
+                &|pos| world.get_block_state_id_if_loaded(&pos),
+            ) {
+                let entity = from_type(&EntityType::IRON_GOLEM, spawn_pos, self, Uuid::new_v4());
+                self.spawn_entity(entity).await;
+                vm.on_golem_spawned(vi);
+            }
+        }
+
+        // Zombie sieges (midnight check, 10% chance, ring-spawn)
+        let siege_results = vm.tick_sieges(is_night, is_midnight, world_age, world_seed, &|pos| {
+            self.get_block_state_id_if_loaded(&pos)
+        });
+        for (_vi, positions) in siege_results {
+            for pos in positions {
+                let entity = from_type(&EntityType::ZOMBIE, pos, self, Uuid::new_v4());
+                self.spawn_entity(entity).await;
+            }
+        }
+
+        // Cat spawning
+        let cat_spawns = vm.try_spawn_cats(world_seed, world_age);
+        drop(vm);
+
+        for (_vi, pos) in cat_spawns {
+            let entity = from_type(&EntityType::CAT, pos, self, Uuid::new_v4());
+            self.spawn_entity(entity).await;
         }
     }
 

@@ -26,6 +26,39 @@ pub enum GossipType {
     Trading = 4,
 }
 
+impl GossipType {
+    /// Maximum value this gossip type can accumulate.
+    #[must_use]
+    pub const fn max_value(self) -> i32 {
+        200
+    }
+
+    /// Amount to decay per gossip cycle (every 20 ticks / 1 second).
+    /// All gossip types decay at the same rate.
+    #[must_use]
+    pub const fn decay_amount(self) -> i32 {
+        1
+    }
+
+    /// Whether this gossip type can be shared between villagers.
+    #[must_use]
+    pub const fn can_be_shared(self) -> bool {
+        matches!(self, Self::MajorNegative | Self::MajorPositive)
+    }
+
+    /// Reputation value contributed per point of this gossip type.
+    #[must_use]
+    pub const fn reputation_weight(self) -> i32 {
+        match self {
+            Self::MajorNegative => -5,
+            Self::MinorNegative => -1,
+            Self::MajorPositive => 5,
+            Self::MinorPositive => 1,
+            Self::Trading => 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct VillagerData {
     pub r#type: VarInt,

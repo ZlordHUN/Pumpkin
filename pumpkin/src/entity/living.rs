@@ -1374,6 +1374,9 @@ impl LivingEntity {
                 .await;
 
             self.reset_effects_and_attributes().await;
+
+            // Notify raid system if this entity was a raider
+            world.on_entity_death(self.entity.entity_id).await;
         }
     }
 
