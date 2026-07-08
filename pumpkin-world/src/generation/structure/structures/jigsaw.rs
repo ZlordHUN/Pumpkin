@@ -5,8 +5,9 @@ use crate::generation::structure::structures::{
     StructureGenerator, StructureGeneratorContext, StructurePieceBase, StructurePosition,
 };
 use crate::generation::structure::template::{
-    BlockMirror, BlockRotation, PaletteEntry, StructureTemplate,
+    BlockMirror, BlockRotation, PaletteEntry, StructureProcessor, StructureTemplate,
 };
+use pumpkin_util::HeightMap;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::random::RandomImpl;
 use serde::Deserialize;
@@ -38,6 +39,7 @@ pub enum PoolElementKind {
     Single {
         template: String,
         processors: ProcessorListRef,
+        legacy: bool,
     },
     List(Vec<Self>),
     Feature(pumpkin_data::placed_feature::PlacedFeature),
@@ -69,6 +71,12 @@ enum RawPoolElement {
     Empty,
     #[serde(rename = "minecraft:single_pool_element")]
     Single {
+        location: String,
+        processors: RawProcessorList,
+        projection: RawProjection,
+    },
+    #[serde(rename = "minecraft:legacy_single_pool_element")]
+    LegacySingle {
         location: String,
         processors: RawProcessorList,
         projection: RawProjection,
@@ -109,6 +117,29 @@ impl From<RawProjection> for JigsawProjection {
 }
 
 impl RawPoolElement {
+    fn single(
+        location: String,
+        processors: RawProcessorList,
+        projection: RawProjection,
+        legacy: bool,
+    ) -> (PoolElementKind, JigsawProjection) {
+        let processors = match processors {
+            RawProcessorList::Named(name) => ProcessorListRef::Named(name),
+            RawProcessorList::Inline { processors } => {
+                debug_assert!(processors.is_empty());
+                ProcessorListRef::Empty
+            }
+        };
+        (
+            PoolElementKind::Single {
+                template: location,
+                processors,
+                legacy,
+            },
+            projection.into(),
+        )
+    }
+
     fn into_element(self) -> Option<(PoolElementKind, JigsawProjection)> {
         match self {
             Self::Empty => Some((PoolElementKind::Empty, JigsawProjection::Rigid)),
@@ -116,22 +147,12 @@ impl RawPoolElement {
                 location,
                 processors,
                 projection,
-            } => {
-                let processors = match processors {
-                    RawProcessorList::Named(name) => ProcessorListRef::Named(name),
-                    RawProcessorList::Inline { processors } => {
-                        debug_assert!(processors.is_empty());
-                        ProcessorListRef::Empty
-                    }
-                };
-                Some((
-                    PoolElementKind::Single {
-                        template: location,
-                        processors,
-                    },
-                    projection.into(),
-                ))
-            }
+            } => Some(Self::single(location, processors, projection, false)),
+            Self::LegacySingle {
+                location,
+                processors,
+                projection,
+            } => Some(Self::single(location, processors, projection, true)),
             Self::List {
                 elements,
                 projection,
@@ -162,6 +183,11 @@ impl PoolElement {
     }
 
     #[must_use]
+    pub const fn ground_level_delta(&self) -> i32 {
+        1
+    }
+
+    #[must_use]
     pub fn first_template(&self) -> Option<Arc<StructureTemplate>> {
         fn find(kind: &PoolElementKind) -> Option<Arc<StructureTemplate>> {
             match kind {
@@ -178,21 +204,22 @@ impl PoolElement {
 
     pub fn for_each_template(
         &self,
-        mut consumer: impl FnMut(&str, &ProcessorListRef, Arc<StructureTemplate>),
+        mut consumer: impl FnMut(&str, &ProcessorListRef, bool, Arc<StructureTemplate>),
     ) {
         fn visit(
             kind: &PoolElementKind,
-            consumer: &mut impl FnMut(&str, &ProcessorListRef, Arc<StructureTemplate>),
+            consumer: &mut impl FnMut(&str, &ProcessorListRef, bool, Arc<StructureTemplate>),
         ) {
             match kind {
                 PoolElementKind::Single {
                     template,
                     processors,
+                    legacy,
                 } => {
                     if let Some(structure_template) =
                         crate::generation::structure::template::get_template(template)
                     {
-                        consumer(template, processors, structure_template);
+                        consumer(template, processors, *legacy, structure_template);
                     }
                 }
                 PoolElementKind::List(elements) => {
@@ -299,6 +326,7 @@ impl TemplatePool {
                         kind: PoolElementKind::Single {
                             template: (*e).to_string(),
                             processors: ProcessorListRef::Empty,
+                            legacy: false,
                         },
                     })
                     .collect(),
@@ -473,22 +501,27 @@ impl StructurePieceBase for PoolElementStructurePiece {
             pumpkin_util::math::vector3::Vector3::new(self.pos.0.x, self.pos.0.y, self.pos.0.z);
 
         self.element
-            .for_each_template(|_name, processor_list, template| {
-                let processors = match processor_list {
+            .for_each_template(|_name, processor_list, legacy, template| {
+                let configured_processors = match processor_list {
                     ProcessorListRef::Named(name) => {
                         crate::generation::structure::template::processor::load_processor_list(name)
                     }
                     ProcessorListRef::Empty => Arc::from([]),
                 };
+                let mut processors = Vec::with_capacity(configured_processors.len() + 1);
+                if self.projection == JigsawProjection::TerrainMatching {
+                    processors.push(StructureProcessor::gravity(HeightMap::WorldSurfaceWg, -1));
+                }
+                processors.extend(configured_processors.iter().cloned());
                 crate::generation::structure::template::place_template(
                     chunk,
                     &template,
                     origin,
                     (0, 0),
                     self.rotation,
-                    false,
+                    legacy,
                     self.liquid_settings == LiquidSettings::ApplyWaterlog,
-                    processors.as_ref(),
+                    &processors,
                     Some(chunk_box),
                 );
             });
@@ -604,6 +637,107 @@ impl StructureGenerator for JigsawGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_data::structures::StructureKeys;
+
+    const VILLAGE_VARIANTS: &[(&str, StructureKeys, usize, u32, u32)] = &[
+        ("plains", StructureKeys::VillagePlains, 8, 204, 4),
+        ("desert", StructureKeys::VillageDesert, 6, 250, 5),
+        ("savanna", StructureKeys::VillageSavanna, 8, 459, 9),
+        ("snowy", StructureKeys::VillageSnowy, 6, 306, 6),
+        ("taiga", StructureKeys::VillageTaiga, 4, 100, 2),
+    ];
+    const ABANDONED_VILLAGE_POOLS: &[(&str, usize, u32)] = &[
+        ("desert/zombie/decor", 4, 28),
+        ("desert/zombie/houses", 29, 68),
+        ("desert/zombie/streets", 11, 35),
+        ("desert/zombie/terminators", 2, 2),
+        ("desert/zombie/villagers", 2, 11),
+        ("plains/zombie/decor", 5, 6),
+        ("plains/zombie/houses", 36, 83),
+        ("plains/zombie/streets", 16, 49),
+        ("plains/zombie/villagers", 2, 11),
+        ("savanna/zombie/decor", 5, 17),
+        ("savanna/zombie/houses", 32, 72),
+        ("savanna/zombie/streets", 19, 56),
+        ("savanna/zombie/terminators", 5, 5),
+        ("savanna/zombie/villagers", 2, 11),
+        ("snowy/zombie/decor", 7, 22),
+        ("snowy/zombie/houses", 31, 65),
+        ("snowy/zombie/streets", 16, 47),
+        ("snowy/zombie/villagers", 2, 11),
+        ("taiga/zombie/decor", 10, 26),
+        ("taiga/zombie/houses", 27, 74),
+        ("taiga/zombie/streets", 16, 49),
+        ("taiga/zombie/villagers", 2, 11),
+    ];
+    const ABANDONED_VILLAGE_DEPENDENCIES: &[(&str, usize, u32)] = &[
+        ("common/animals", 10, 26),
+        ("common/butcher_animals", 4, 8),
+        ("common/cats", 11, 13),
+        ("common/iron_golem", 1, 1),
+        ("common/sheep", 2, 2),
+        ("common/well_bottoms", 1, 1),
+        ("plains/terminators", 4, 4),
+        ("snowy/terminators", 4, 4),
+        ("taiga/terminators", 4, 4),
+    ];
+
+    fn assert_pool(id: &str, element_count: usize, total_weight: u32, fallback: &str) {
+        let pool = TemplatePool::discover(id).unwrap_or_else(|| panic!("missing pool {id}"));
+        assert_eq!(pool.elements.len(), element_count, "{id}");
+        assert_eq!(
+            pool.elements
+                .iter()
+                .map(|element| element.weight)
+                .sum::<u32>(),
+            total_weight,
+            "{id}"
+        );
+        assert_eq!(pool.fallback, fallback, "{id}");
+    }
+
+    fn is_abandoned(kind: &PoolElementKind) -> bool {
+        matches!(
+            kind,
+            PoolElementKind::Single { template, .. } if template.contains("/zombie/")
+        )
+    }
+
+    fn village_pool_id(path: &str) -> String {
+        format!("minecraft:village/{path}")
+    }
+
+    fn abandoned_fallback(path: &str) -> String {
+        let (biome, pool) = path.split_once("/zombie/").unwrap();
+        if matches!(pool, "houses" | "streets") {
+            if matches!(biome, "desert" | "savanna") {
+                village_pool_id(&format!("{biome}/zombie/terminators"))
+            } else {
+                village_pool_id(&format!("{biome}/terminators"))
+            }
+        } else {
+            "minecraft:empty".to_string()
+        }
+    }
+
+    fn assert_legacy_pool_templates(id: &str) {
+        let pool = TemplatePool::discover(id).unwrap_or_else(|| panic!("missing pool {id}"));
+        for element in pool.elements {
+            match element.kind {
+                PoolElementKind::Single {
+                    template, legacy, ..
+                } => {
+                    assert!(legacy, "{template} must use legacy placement");
+                    assert!(
+                        crate::generation::structure::template::get_template(&template).is_some(),
+                        "missing template {template}"
+                    );
+                }
+                PoolElementKind::Empty | PoolElementKind::Feature(_) => {}
+                PoolElementKind::List(_) => panic!("unexpected list element in {id}"),
+            }
+        }
+    }
 
     #[test]
     fn ancient_city_pools_match_vanilla_weights() {
@@ -629,6 +763,190 @@ mod tests {
                 "{id}"
             );
             assert_eq!(pool.fallback, "minecraft:empty", "{id}");
+        }
+    }
+
+    #[test]
+    fn village_start_pools_match_vanilla_abandoned_weights() {
+        for &(biome, _, element_count, total_weight, abandoned_weight) in VILLAGE_VARIANTS {
+            let id = village_pool_id(&format!("{biome}/town_centers"));
+            let pool = TemplatePool::discover(&id).unwrap_or_else(|| panic!("missing pool {id}"));
+            assert_eq!(pool.elements.len(), element_count, "{id}");
+            assert_eq!(
+                pool.elements
+                    .iter()
+                    .map(|element| element.weight)
+                    .sum::<u32>(),
+                total_weight,
+                "{id}"
+            );
+
+            let actual_abandoned_weight = pool
+                .elements
+                .iter()
+                .filter(|element| is_abandoned(&element.kind))
+                .map(|element| element.weight)
+                .sum::<u32>();
+            assert_eq!(actual_abandoned_weight, abandoned_weight, "{id}");
+        }
+    }
+
+    #[test]
+    fn abandoned_village_starts_build_jigsaw_graphs() {
+        for &(biome, structure_key, _, _, _) in VILLAGE_VARIANTS {
+            let pool_id = village_pool_id(&format!("{biome}/town_centers"));
+            let pool = TemplatePool::discover(&pool_id).unwrap();
+            let seed = (0i64..10_000)
+                .find(|seed| {
+                    let mut random = super::super::create_chunk_random(*seed, 0, 0);
+                    is_abandoned(&pool.get_random_element(&mut random).kind)
+                })
+                .expect("no abandoned start selected");
+            let structure = pumpkin_data::structures::Structure::get(&structure_key);
+            let generator = JigsawGenerator::new(&pool_id, structure.size.unwrap());
+            let context = StructureGeneratorContext {
+                seed,
+                chunk_x: 0,
+                chunk_z: 0,
+                random: super::super::create_chunk_random(seed, 0, 0),
+                sea_level: 63,
+                min_y: -64,
+                height_sampler: None,
+                structure_key: Some(structure_key),
+            };
+
+            let position = generator
+                .get_structure_position(context)
+                .unwrap_or_else(|| panic!("{pool_id} did not generate"));
+            let collector = position.collector.lock().unwrap();
+            let start = collector.pieces[0]
+                .as_any()
+                .downcast_ref::<PoolElementStructurePiece>()
+                .expect("village start must be a pool element");
+            assert!(is_abandoned(&start.element.kind), "{pool_id}");
+            assert_eq!(
+                start.ground_level_delta,
+                start.element.ground_level_delta(),
+                "{pool_id}"
+            );
+
+            let mut terrain_matching_pieces = 0;
+            for piece in collector
+                .pieces
+                .iter()
+                .filter_map(|piece| piece.as_any().downcast_ref::<PoolElementStructurePiece>())
+            {
+                if piece.projection == JigsawProjection::TerrainMatching {
+                    terrain_matching_pieces += 1;
+                    assert_eq!(
+                        piece.ground_level_delta,
+                        piece.element.ground_level_delta(),
+                        "{pool_id}"
+                    );
+                }
+            }
+            assert!(terrain_matching_pieces > 0, "{pool_id} produced no streets");
+            assert!(collector.pieces.len() > 1, "{pool_id} produced no branches");
+        }
+    }
+
+    #[test]
+    fn abandoned_village_pools_match_vanilla_weights() {
+        for &(path, element_count, total_weight) in ABANDONED_VILLAGE_POOLS {
+            let id = village_pool_id(path);
+            assert_pool(&id, element_count, total_weight, &abandoned_fallback(path));
+        }
+    }
+
+    #[test]
+    fn abandoned_village_dependency_pools_match_vanilla_weights() {
+        for &(path, element_count, total_weight) in ABANDONED_VILLAGE_DEPENDENCIES {
+            assert_pool(
+                &village_pool_id(path),
+                element_count,
+                total_weight,
+                "minecraft:empty",
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_village_templates_are_embedded_and_use_legacy_placement() {
+        for &(biome, _, _, _, _) in VILLAGE_VARIANTS {
+            assert_legacy_pool_templates(&village_pool_id(&format!("{biome}/town_centers")));
+        }
+        for &(path, _, _) in ABANDONED_VILLAGE_POOLS {
+            assert_legacy_pool_templates(&village_pool_id(path));
+        }
+        for &(path, _, _) in ABANDONED_VILLAGE_DEPENDENCIES {
+            assert_legacy_pool_templates(&village_pool_id(path));
+        }
+    }
+
+    #[test]
+    fn abandoned_village_template_states_resolve_for_every_rotation() {
+        let mut pool_ids = VILLAGE_VARIANTS
+            .iter()
+            .map(|(biome, ..)| village_pool_id(&format!("{biome}/town_centers")))
+            .collect::<Vec<_>>();
+        pool_ids.extend(
+            ABANDONED_VILLAGE_POOLS
+                .iter()
+                .map(|(path, ..)| village_pool_id(path)),
+        );
+        pool_ids.extend(
+            ABANDONED_VILLAGE_DEPENDENCIES
+                .iter()
+                .map(|(path, ..)| village_pool_id(path)),
+        );
+
+        for pool_id in pool_ids {
+            let pool = TemplatePool::discover(&pool_id).unwrap();
+            for element in &pool.elements {
+                element.for_each_template(|name, _, _, template| {
+                    for entry in &template.palette {
+                        for rotation in BlockRotation::values() {
+                            assert!(
+                                crate::generation::structure::template::BlockStateResolver::resolve(
+                                    entry,
+                                    rotation,
+                                    BlockMirror::None,
+                                )
+                                .is_some(),
+                                "{name} has unresolved state {} at {rotation:?}",
+                                entry.name
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn abandoned_village_decor_features_are_executable() {
+        fn assert_features(kind: &PoolElementKind, pool_id: &str) {
+            match kind {
+                PoolElementKind::Feature(feature) => assert!(
+                    crate::generation::feature::placed_features::PLACED_FEATURES
+                        .contains_key(feature),
+                    "{pool_id} uses an unsupported placed feature"
+                ),
+                PoolElementKind::List(elements) => {
+                    for element in elements {
+                        assert_features(element, pool_id);
+                    }
+                }
+                PoolElementKind::Empty | PoolElementKind::Single { .. } => {}
+            }
+        }
+
+        for &(path, _, _) in ABANDONED_VILLAGE_POOLS {
+            let pool_id = village_pool_id(path);
+            let pool = TemplatePool::discover(&pool_id).unwrap();
+            for element in &pool.elements {
+                assert_features(&element.kind, &pool_id);
+            }
         }
     }
 

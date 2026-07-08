@@ -51,6 +51,17 @@ pub const MAX_TOTAL_STRUCTURE_RANGE: i32 = 128;
 pub const MIN_DEPTH: i32 = 0;
 pub const MAX_DEPTH: i32 = 20;
 
+pub(crate) struct JigsawPlacementStart {
+    pub(crate) start_pos: BlockPos,
+    pub(crate) element: PoolElement,
+    template: Arc<StructureTemplate>,
+    rotation: Rotation,
+    adjusted_position: BlockPos,
+    bottom_y: i32,
+    bounding_box: BlockBox,
+    global_bounding_box: BlockBox,
+}
+
 /// Simple lookup for Pool Aliases introduced in 1.20+
 pub struct PoolAliasLookup;
 
@@ -64,6 +75,105 @@ impl PoolAliasLookup {
 }
 
 impl JigsawPlacement {
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn create_start(
+        context: &mut StructureGeneratorContext,
+        start_pool_id: &str,
+        start_jigsaw: Option<&str>,
+        position: BlockPos,
+        project_start_to_heightmap: bool,
+        max_distance_from_center: &MaxDistance,
+        dimension_padding: &DimensionPadding,
+        pool_alias_lookup: &PoolAliasLookup,
+    ) -> Option<JigsawPlacementStart> {
+        if max_distance_from_center.horizontal > MAX_TOTAL_STRUCTURE_RANGE {
+            return None;
+        }
+
+        let actual_start_pool_id = pool_alias_lookup.lookup(start_pool_id);
+        let pool = TemplatePool::discover(actual_start_pool_id)?;
+        let element = pool.get_random_element(&mut context.random).clone();
+        let template = element.first_template()?;
+
+        let rotation = Rotation::from_index(context.random.next_bounded_i32(4) as u8);
+
+        let anchored_position = if let Some(target_jigsaw_id) = start_jigsaw {
+            let mut found_anchor = None;
+            let jigsaws = get_jigsaw_blocks(&template);
+            for jigsaw in jigsaws {
+                if jigsaw.name == target_jigsaw_id {
+                    let rotated_pos = rotation.transform_pos(jigsaw.pos.0, template.size);
+                    found_anchor = Some(position.add(rotated_pos.x, rotated_pos.y, rotated_pos.z));
+                    break;
+                }
+            }
+
+            found_anchor?
+        } else {
+            position
+        };
+
+        let local_anchor_position = anchored_position.0.sub(&position.0);
+        let adjusted_position = BlockPos(position.0.sub(&local_anchor_position));
+
+        let rotated_size = rotation.transform_size(template.size);
+        let mut bounding_box = BlockBox::new(
+            adjusted_position.0.x,
+            adjusted_position.0.y,
+            adjusted_position.0.z,
+            adjusted_position.0.x + rotated_size.x - 1,
+            adjusted_position.0.y + rotated_size.y - 1,
+            adjusted_position.0.z + rotated_size.z - 1,
+        );
+
+        let center_x = i32::midpoint(bounding_box.max.x, bounding_box.min.x);
+        let center_z = i32::midpoint(bounding_box.max.z, bounding_box.min.z);
+
+        let bottom_y = if project_start_to_heightmap {
+            if let Some(sampler) = &mut context.height_sampler {
+                sampler
+                    .estimate_height(center_x, center_z)
+                    .max(context.sea_level)
+            } else {
+                adjusted_position.0.y
+            }
+        } else {
+            adjusted_position.0.y
+        };
+
+        let old_min_y = bounding_box.min.y;
+        bounding_box.move_pos(0, bottom_y - old_min_y, 0);
+
+        if bounding_box.min.y < context.min_y + dimension_padding.bottom
+            || bounding_box.max.y > context.min_y + 320 - dimension_padding.top
+        {
+            return None;
+        }
+
+        let center_y = bottom_y + local_anchor_position.y;
+        let global_bounding_box = BlockBox::new(
+            center_x - max_distance_from_center.horizontal,
+            (center_y - max_distance_from_center.vertical)
+                .max(context.min_y + dimension_padding.bottom),
+            center_z - max_distance_from_center.horizontal,
+            center_x + max_distance_from_center.horizontal + 1,
+            (center_y + max_distance_from_center.vertical + 1)
+                .min(context.min_y + 320 - dimension_padding.top),
+            center_z + max_distance_from_center.horizontal + 1,
+        );
+
+        Some(JigsawPlacementStart {
+            start_pos: BlockPos::new(center_x, center_y, center_z),
+            element,
+            template,
+            rotation,
+            adjusted_position,
+            bottom_y,
+            bounding_box,
+            global_bounding_box,
+        })
+    }
+
     #[expect(clippy::too_many_arguments)]
     #[expect(clippy::too_many_lines)]
     pub fn add_pieces(
@@ -79,86 +189,27 @@ impl JigsawPlacement {
         liquid_settings: LiquidSettings,
         pool_alias_lookup: &PoolAliasLookup,
     ) -> Option<StructurePosition> {
-        if max_distance_from_center.horizontal > MAX_TOTAL_STRUCTURE_RANGE {
-            return None;
-        }
-
         let max_depth = max_depth.clamp(MIN_DEPTH, MAX_DEPTH);
 
-        let actual_start_pool_id = pool_alias_lookup.lookup(start_pool_id);
-        let pool = TemplatePool::discover(actual_start_pool_id)?;
-        let element = pool.get_random_element(&mut context.random).clone();
-        let template = element.first_template()?;
-
-        let rotation = Rotation::from_index(context.random.next_bounded_i32(4) as u8);
-
-        let mut anchored_position = position;
-        if let Some(target_jigsaw_id) = start_jigsaw {
-            let mut found_anchor = None;
-            let jigsaws = get_jigsaw_blocks(&template);
-            for jigsaw in jigsaws {
-                if jigsaw.name == target_jigsaw_id {
-                    let rotated_pos = rotation.transform_pos(jigsaw.pos.0, template.size);
-                    found_anchor = Some(position.add(rotated_pos.x, rotated_pos.y, rotated_pos.z));
-                    break;
-                }
-            }
-
-            {
-                let anchor = found_anchor?;
-                anchored_position = anchor;
-            }
-        }
-
-        let local_anchor_position = anchored_position.0.sub(&position.0);
-        let adjusted_position = BlockPos(position.0.sub(&local_anchor_position));
-
-        let rotated_size = rotation.transform_size(template.size);
-        let mut box_ = BlockBox::new(
-            adjusted_position.0.x,
-            adjusted_position.0.y,
-            adjusted_position.0.z,
-            adjusted_position.0.x + rotated_size.x - 1,
-            adjusted_position.0.y + rotated_size.y - 1,
-            adjusted_position.0.z + rotated_size.z - 1,
-        );
-
-        let center_x = i32::midpoint(box_.max.x, box_.min.x);
-        let center_z = i32::midpoint(box_.max.z, box_.min.z);
-
-        let bottom_y = if project_start_to_heightmap {
-            if let Some(sampler) = &mut context.height_sampler {
-                sampler
-                    .estimate_height(center_x, center_z)
-                    .max(context.sea_level)
-            } else {
-                adjusted_position.0.y
-            }
-        } else {
-            adjusted_position.0.y
-        };
-
-        let old_min_y = box_.min.y;
-        box_.move_pos(0, bottom_y - old_min_y, 0);
-
-        if box_.min.y < context.min_y + dimension_padding.bottom
-            || box_.max.y > context.min_y + 320 - dimension_padding.top
-        {
-            return None;
-        }
-
-        let center_y = bottom_y + local_anchor_position.y;
-
-        let global_bounding_box = BlockBox::new(
-            center_x - max_distance_from_center.horizontal,
-            (center_y - max_distance_from_center.vertical)
-                .max(context.min_y + dimension_padding.bottom),
-            center_z - max_distance_from_center.horizontal,
-            center_x + max_distance_from_center.horizontal + 1,
-            (center_y + max_distance_from_center.vertical + 1)
-                .min(context.min_y + 320 - dimension_padding.top),
-            center_z + max_distance_from_center.horizontal + 1,
-        );
+        let JigsawPlacementStart {
+            start_pos,
+            element,
+            template,
+            rotation,
+            adjusted_position,
+            bottom_y,
+            bounding_box: box_,
+            global_bounding_box,
+        } = Self::create_start(
+            context,
+            start_pool_id,
+            start_jigsaw,
+            position,
+            project_start_to_heightmap,
+            max_distance_from_center,
+            dimension_padding,
+            pool_alias_lookup,
+        )?;
 
         let mut jigsaw_blocks = Vec::new();
         for block in &template.blocks {
@@ -189,7 +240,7 @@ impl JigsawPlacement {
             mirror: Mirror::None,
             jigsaw_blocks,
             junctions: Vec::new(),
-            ground_level_delta: 0,
+            ground_level_delta: element.ground_level_delta(),
             liquid_settings,
             projection: element.projection,
         });
@@ -432,7 +483,7 @@ impl JigsawPlacement {
                                     let target_ground_level_delta = if target_rigid {
                                         source_ground_level_delta - delta_y
                                     } else {
-                                        0
+                                        element.ground_level_delta()
                                     };
 
                                     let target_piece = Box::new(PoolElementStructurePiece {
@@ -523,7 +574,7 @@ impl JigsawPlacement {
         }
 
         Some(StructurePosition {
-            start_pos: BlockPos::new(center_x, center_y, center_z),
+            start_pos,
             collector: Arc::new(std::sync::Mutex::new(collector)),
         })
     }

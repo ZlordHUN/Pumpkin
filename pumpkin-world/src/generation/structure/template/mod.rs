@@ -48,6 +48,13 @@ pub use pumpkin_data::{Mirror as BlockMirror, Rotation as BlockRotation};
 pub use structure_template::{PaletteEntry, StructureTemplate, TemplateBlock, TemplateEntity};
 pub use template_piece::TemplatePiece;
 
+struct ProcessedBlock {
+    pos: Vector3<i32>,
+    state: &'static pumpkin_data::BlockState,
+    block_entity_nbt: Option<NbtCompound>,
+    block_name: String,
+}
+
 /// Places a template at a world origin with an un-rotated XZ offset.
 ///
 /// All rotation is handled internally:
@@ -73,6 +80,7 @@ pub fn place_template(
     let (rotated_ox, rotated_oz) = rotation.rotate_offset(offset.0, offset.1);
     let world_x = origin.x + rotated_ox;
     let world_z = origin.z + rotated_oz;
+    let mut processed_blocks = Vec::with_capacity(template.blocks.len());
 
     for block in &template.blocks {
         let palette_entry = &template.palette[block.state as usize];
@@ -113,86 +121,109 @@ pub fn place_template(
         // Rotate block position within template bounds
         let local_pos = rotation.transform_pos(block.pos, template.size);
 
-        let wx = world_x + local_pos.x;
-        let wy = origin.y + local_pos.y;
-        let wz = world_z + local_pos.z;
-
-        if let Some(bbox) = chunk_box
-            && (wx < bbox.min.x
-                || wx > bbox.max.x
-                || wy < bbox.min.y
-                || wy > bbox.max.y
-                || wz < bbox.min.z
-                || wz > bbox.max.z)
-        {
-            continue;
-        }
-
-        let world_pos = Vector3::new(wx, wy, wz);
-
-        if apply_waterlogging
-            && chunk.get_block_state(&world_pos).to_block_id() == pumpkin_data::Block::WATER.id
-            && let Some((_, waterlogged)) = placed_entry
-                .properties
-                .iter_mut()
-                .find(|(name, _)| name == "waterlogged")
-        {
-            *waterlogged = "true".to_string();
-            if let Some(waterlogged_state) =
-                BlockStateResolver::resolve(&placed_entry, rotation, Mirror::default())
-            {
-                state = waterlogged_state;
-            }
-        }
+        let mut world_pos = Vector3::new(
+            world_x + local_pos.x,
+            origin.y + local_pos.y,
+            world_z + local_pos.z,
+        );
 
         // Apply processors
         let mut should_place = true;
         for processor in processors {
-            let Some(processed_state) = processor.process(chunk, world_pos, state) else {
+            let Some((processed_pos, processed_state)) = processor.process(
+                chunk,
+                block.pos,
+                world_pos,
+                state,
+                rotation,
+                Mirror::default(),
+            ) else {
                 should_place = false;
                 break;
             };
+            world_pos = processed_pos;
             state = processed_state;
         }
         if !should_place {
             continue;
         }
 
-        chunk.set_block_state(wx, wy, wz, state);
+        if let Some(bbox) = chunk_box
+            && (world_pos.x < bbox.min.x
+                || world_pos.x > bbox.max.x
+                || world_pos.y < bbox.min.y
+                || world_pos.y > bbox.max.y
+                || world_pos.z < bbox.min.z
+                || world_pos.z > bbox.max.z)
+        {
+            continue;
+        }
 
-        // Create block entities for interactive blocks (furnaces, chests, etc.)
-        let block_entity_id = get_block_entity_id(&placed_entry.name);
-        if block_entity_nbt.is_some() || block_entity_id.is_some() {
-            let block_entity_id = block_entity_id.unwrap_or(&placed_entry.name);
-            let mut placed_nbt = NbtCompound::new();
+        processed_blocks.push(ProcessedBlock {
+            pos: world_pos,
+            state,
+            block_entity_nbt,
+            block_name: placed_entry.name,
+        });
+    }
 
-            placed_nbt.put_string("id", block_entity_id.to_string());
-            placed_nbt.put_int("x", wx);
-            placed_nbt.put_int("y", wy);
-            placed_nbt.put_int("z", wz);
+    for processed in processed_blocks {
+        place_processed_block(chunk, processed, apply_waterlogging);
+    }
+}
 
-            if let Some(template_nbt) = &block_entity_nbt {
-                for (key, value) in &template_nbt.child_tags {
-                    if key.as_ref() != "x"
-                        && key.as_ref() != "y"
-                        && key.as_ref() != "z"
-                        && key.as_ref() != "id"
-                    {
-                        placed_nbt.child_tags.insert(key.clone(), value.clone());
-                    }
-                }
-            }
+fn place_processed_block(
+    chunk: &mut ProtoChunk,
+    processed: ProcessedBlock,
+    apply_waterlogging: bool,
+) {
+    let ProcessedBlock {
+        pos,
+        mut state,
+        block_entity_nbt,
+        block_name,
+    } = processed;
 
-            if placed_nbt.get_string("LootTable").is_some()
-                && placed_nbt.get_long("LootTableSeed").is_none()
+    if apply_waterlogging
+        && chunk.get_block_state(&pos).to_block_id() == pumpkin_data::Block::WATER.id
+        && let Some(waterlogged_state) = state.with_waterlogged()
+    {
+        state = waterlogged_state;
+    }
+
+    chunk.set_block_state(pos.x, pos.y, pos.z, state);
+
+    let block_entity_id = get_block_entity_id(&block_name);
+    if block_entity_nbt.is_none() && block_entity_id.is_none() {
+        return;
+    }
+
+    let mut placed_nbt = NbtCompound::new();
+    placed_nbt.put_string("id", block_entity_id.unwrap_or(&block_name).to_string());
+    placed_nbt.put_int("x", pos.x);
+    placed_nbt.put_int("y", pos.y);
+    placed_nbt.put_int("z", pos.z);
+
+    if let Some(template_nbt) = block_entity_nbt {
+        for (key, value) in template_nbt.child_tags {
+            if key.as_ref() != "x"
+                && key.as_ref() != "y"
+                && key.as_ref() != "z"
+                && key.as_ref() != "id"
             {
-                let mut random = LegacyRand::from_seed(hash_block_pos(wx, wy, wz) as u64);
-                placed_nbt.put_long("LootTableSeed", random.next_i64());
+                placed_nbt.child_tags.insert(key, value);
             }
-
-            chunk.add_block_entity(placed_nbt);
         }
     }
+
+    if placed_nbt.get_string("LootTable").is_some()
+        && placed_nbt.get_long("LootTableSeed").is_none()
+    {
+        let mut random = LegacyRand::from_seed(hash_block_pos(pos.x, pos.y, pos.z) as u64);
+        placed_nbt.put_long("LootTableSeed", random.next_i64());
+    }
+
+    chunk.add_block_entity(placed_nbt);
 }
 
 /// Returns the block entity ID for blocks that require one, or None if not needed.
@@ -224,5 +255,145 @@ fn get_block_entity_id(block_name: &str) -> Option<&'static str> {
         | "minecraft:warped_sign" => Some("minecraft:sign"),
         "minecraft:hanging_sign" => Some("minecraft:hanging_sign"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::{Block, BlockState, dimension::Dimension};
+    use pumpkin_util::{HeightMap, world_seed::Seed};
+
+    fn empty_chunk() -> ProtoChunk {
+        let generator = crate::generation::get_world_gen(Seed(0), Dimension::OVERWORLD);
+        ProtoChunk::new(0, 0, &generator)
+    }
+
+    fn single_block_template(state: PaletteEntry) -> StructureTemplate {
+        StructureTemplate {
+            size: Vector3::new(1, 1, 1),
+            palette: vec![state],
+            blocks: vec![TemplateBlock {
+                pos: Vector3::new(0, 0, 0),
+                state: 0,
+                nbt: None,
+            }],
+            entities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terrain_matching_street_replaces_water_with_planks() {
+        let mut chunk = empty_chunk();
+        chunk.set_block_state(4, 62, 4, Block::WATER.default_state);
+        let template = single_block_template(PaletteEntry::new("minecraft:dirt_path".to_string()));
+        let street_processors = processor::load_processor_list("minecraft:street_plains");
+        let mut processors = vec![StructureProcessor::gravity(HeightMap::WorldSurfaceWg, -1)];
+        processors.extend(street_processors.iter().cloned());
+
+        place_template(
+            &mut chunk,
+            &template,
+            Vector3::new(4, 100, 4),
+            (0, 0),
+            Rotation::None,
+            false,
+            true,
+            &processors,
+            None,
+        );
+
+        assert_eq!(
+            chunk.get_block_state(&Vector3::new(4, 62, 4)).to_block_id(),
+            Block::OAK_PLANKS.id
+        );
+        assert_eq!(
+            chunk
+                .get_block_state(&Vector3::new(4, 100, 4))
+                .to_block_id(),
+            Block::AIR.id
+        );
+    }
+
+    #[test]
+    fn gravity_uses_the_pre_placement_heightmap_for_the_whole_template() {
+        let mut chunk = empty_chunk();
+        chunk.set_block_state(4, 62, 4, Block::WATER.default_state);
+        let template = StructureTemplate {
+            size: Vector3::new(1, 3, 1),
+            palette: vec![PaletteEntry::new("minecraft:stone".to_string())],
+            blocks: vec![
+                TemplateBlock {
+                    pos: Vector3::new(0, 1, 0),
+                    state: 0,
+                    nbt: None,
+                },
+                TemplateBlock {
+                    pos: Vector3::new(0, 2, 0),
+                    state: 0,
+                    nbt: None,
+                },
+            ],
+            entities: Vec::new(),
+        };
+        let processors = [StructureProcessor::gravity(HeightMap::WorldSurfaceWg, -1)];
+
+        place_template(
+            &mut chunk,
+            &template,
+            Vector3::new(4, 100, 4),
+            (0, 0),
+            Rotation::None,
+            false,
+            true,
+            &processors,
+            None,
+        );
+
+        assert_eq!(
+            chunk.get_block_state(&Vector3::new(4, 63, 4)).to_block_id(),
+            Block::STONE.id
+        );
+        assert_eq!(
+            chunk.get_block_state(&Vector3::new(4, 64, 4)).to_block_id(),
+            Block::STONE.id
+        );
+        assert_eq!(
+            chunk.get_block_state(&Vector3::new(4, 65, 4)).to_block_id(),
+            Block::AIR.id
+        );
+    }
+
+    #[test]
+    fn village_rules_run_before_waterlogging() {
+        let mut chunk = empty_chunk();
+        chunk.set_block_state(4, 62, 4, Block::WATER.default_state);
+        let template = single_block_template(PaletteEntry::with_properties(
+            "minecraft:glass_pane".to_string(),
+            vec![
+                ("east".to_string(), "false".to_string()),
+                ("north".to_string(), "true".to_string()),
+                ("south".to_string(), "true".to_string()),
+                ("waterlogged".to_string(), "false".to_string()),
+                ("west".to_string(), "false".to_string()),
+            ],
+        ));
+        let processors = processor::load_processor_list("minecraft:zombie_plains");
+
+        place_template(
+            &mut chunk,
+            &template,
+            Vector3::new(4, 62, 4),
+            (0, 0),
+            Rotation::None,
+            false,
+            true,
+            &processors,
+            None,
+        );
+
+        let state = BlockState::from_id(chunk.get_block_state(&Vector3::new(4, 62, 4)));
+        assert_eq!(state.id.to_block_id(), Block::BROWN_STAINED_GLASS_PANE.id);
+        assert!(state.is_waterlogged());
     }
 }

@@ -28,6 +28,7 @@ mod help;
 mod kick;
 mod kill;
 mod list;
+mod locate;
 mod me;
 mod msg;
 mod op;
@@ -152,6 +153,7 @@ pub async fn default_dispatcher(
     kill::register(&mut dispatcher, registry);
     op::register(&mut dispatcher, registry);
     list::register(&mut dispatcher, registry);
+    locate::register(&mut dispatcher, registry);
     seed::register(&mut dispatcher, registry);
     setidletimeout::register(&mut dispatcher, registry);
     stop::register(&mut dispatcher, registry);
