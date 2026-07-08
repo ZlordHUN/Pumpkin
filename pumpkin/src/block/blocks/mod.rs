@@ -89,6 +89,7 @@ pub mod infested;
 pub mod powder_snow;
 pub mod snow;
 pub mod sponge;
+pub mod suspicious;
 
 // Entities, hazards & misc gameplay blocks
 pub mod anvil;
@@ -100,6 +101,7 @@ pub mod spawner;
 pub mod tnt;
 
 pub mod coral;
+pub mod decorated_pot;
 
 // Misc / abstract
 pub mod abstract_wall_mounting;

@@ -150,9 +150,23 @@ impl TemplatePiece {
             // Place the block
             chunk.set_block_state(world_pos.x, world_pos.y, world_pos.z, state);
 
-            // TODO: Handle block entity data (block.nbt)
-            // This would involve creating a block entity at this position
-            // and populating it with the NBT data
+            // Handle block entity data from template NBT
+            if let Some(mut nbt) = block.nbt.clone() {
+                // Ensure position is set in the NBT for block entity creation
+                nbt.put_int("x", world_pos.x);
+                nbt.put_int("y", world_pos.y);
+                nbt.put_int("z", world_pos.z);
+
+                // Set the block entity ID if not already present
+                if !nbt.has("id") {
+                    // Derive the block entity ID from the block name
+                    let block_name = palette_entry.name.clone();
+                    // Use the block name directly as the entity type (e.g. "minecraft:chest", "minecraft:brushable_block")
+                    nbt.put_string("id", block_name);
+                }
+
+                chunk.add_block_entity(nbt);
+            }
         }
     }
 }

@@ -20,6 +20,7 @@ use crate::block::blocks::conduit::ConduitBlock;
 use crate::block::blocks::coral::coral_block::CoralBlock;
 use crate::block::blocks::coral::coral_fan::CoralFanBlock;
 use crate::block::blocks::coral::coral_plant::CoralPlantBlock;
+use crate::block::blocks::decorated_pot::DecoratedPotBlock;
 use crate::block::blocks::dirt_path::DirtPathBlock;
 use crate::block::blocks::doors::DoorBlock;
 use crate::block::blocks::dripstone::DripstoneBlock;
@@ -120,6 +121,7 @@ use crate::block::blocks::snow::LayeredSnowBlock;
 use crate::block::blocks::spawner::SpawnerBlock;
 use crate::block::blocks::sponge::{SpongeBlock, WetSpongeBlock};
 use crate::block::blocks::stairs::StairBlock;
+use crate::block::blocks::suspicious::SuspiciousSandBlock;
 use crate::block::blocks::tnt::TNTBlock;
 use crate::block::blocks::torches::TorchBlock;
 use crate::block::blocks::trapdoor::TrapDoorBlock;
@@ -305,9 +307,11 @@ pub fn default_registry() -> Arc<BlockRegistry> {
     manager.register(CoralPlantBlock);
     manager.register(CoralBlock);
     manager.register(AmethystBlock);
+    manager.register(DecoratedPotBlock);
     manager.register(GrassBlock);
 
     manager.register(FallingBlock);
+    manager.register(SuspiciousSandBlock);
 
     // Fire
     manager.register(SoulFireBlock);

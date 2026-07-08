@@ -15,12 +15,14 @@ pub mod bed;
 pub mod bell;
 pub mod blasting_furnace;
 pub mod brewing_stand;
+pub mod brushable;
 pub mod chest;
 pub mod chest_like_block_entity;
 pub mod chiseled_bookshelf;
 pub mod command_block;
 pub mod comparator;
 pub mod daylight_detector;
+pub mod decorated_pot;
 pub mod dropper;
 pub mod end_portal;
 pub mod ender_chest;
@@ -216,6 +218,12 @@ pub fn block_entity_from_nbt(nbt: &NbtCompound) -> Option<Arc<dyn BlockEntity>> 
         }
         bed::BedBlockEntity::ID => Some(Arc::new(bed::BedBlockEntity::from_nbt(nbt, pos))),
         bell::BellBlockEntity::ID => Some(Arc::new(bell::BellBlockEntity::from_nbt(nbt, pos))),
+        brushable::BrushableBlockEntity::ID => Some(Arc::new(
+            brushable::BrushableBlockEntity::from_nbt(nbt, pos),
+        )),
+        decorated_pot::DecoratedPotBlockEntity::ID => Some(Arc::new(
+            decorated_pot::DecoratedPotBlockEntity::from_nbt(nbt, pos),
+        )),
         shulker_box::ShulkerBoxBlockEntity::ID => Some(Arc::new(
             shulker_box::ShulkerBoxBlockEntity::from_nbt(nbt, pos),
         )),

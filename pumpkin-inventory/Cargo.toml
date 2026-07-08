@@ -18,6 +18,7 @@ pumpkin-data = { workspace = true, features = [
     "potion",
     "statistic",
 ] }
+pumpkin-nbt.workspace = true
 
 pumpkin-world.workspace = true
 pumpkin-util.workspace = true

@@ -29,12 +29,16 @@ use crate::screen_handler::{
 };
 use crate::slot::{BoxFuture, NormalSlot, Slot};
 
+use pumpkin_data::data_component::DataComponent;
+use pumpkin_data::data_component_impl::BlockEntityDataImpl;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::recipes::{CraftingRecipeTypes, RECIPES_CRAFTING};
 use pumpkin_data::screen::WindowType;
 use pumpkin_data::statistic::StatisticCategory;
 use pumpkin_data::tag;
 use pumpkin_data::tag::Taggable;
+use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::codec::recipe::{DynamicRecipe, OwnedCraftingRecipe};
 use pumpkin_world::inventory::Inventory;
 use tokio::sync::Mutex;
@@ -54,6 +58,12 @@ pub struct ResultSlot {
 pub struct RecipeResult {
     pub item_id: String,
     pub count: u8,
+    /// Optional component data to apply to the crafted ItemStack.
+    /// Each entry is a (DataComponent, impl) pair.
+    pub components: Vec<(
+        DataComponent,
+        Option<Box<dyn pumpkin_data::data_component_impl::DataComponentImpl>>,
+    )>,
 }
 
 /// Checks if a recipe pattern is symmetrical horizontally.
@@ -168,6 +178,7 @@ async fn recipe_matches(
             matched.then_some(RecipeResult {
                 item_id: result.id.to_string(),
                 count: result.count,
+                components: Vec::new(),
             })
         }
         GenericRecipe::Vanilla(CraftingRecipeTypes::CraftingShapeless {
@@ -196,6 +207,7 @@ async fn recipe_matches(
             Some(RecipeResult {
                 item_id: result.id.to_string(),
                 count: result.count,
+                components: Vec::new(),
             })
         }
         GenericRecipe::Vanilla(CraftingRecipeTypes::CraftingTransmute {
@@ -220,13 +232,22 @@ async fn recipe_matches(
             Some(RecipeResult {
                 item_id: result.id.to_string(),
                 count: result.count,
+                components: Vec::new(),
             })
         }
         GenericRecipe::Vanilla(CraftingRecipeTypes::CraftingDecoratedPot { .. }) => {
             if count != 4 || inventory.get_width() != 3 || inventory.get_height() != 3 {
                 return None;
             }
-            for position in (1..=7).step_by(2) {
+
+            // Collect the 4 sherd item IDs from the crafting grid.
+            // Positions 1, 3, 5, 7 in a 3x3 grid correspond to:
+            //   0 1 2
+            //   3 4 5
+            //   6 7 8
+            // Sherd order in the pot: back (1), left (3), right (5), front (7)
+            let mut sherd_ids: Vec<String> = Vec::with_capacity(4);
+            for position in [1usize, 3, 5, 7] {
                 let slot = inventory.get_stack(position).await;
                 let slot = slot.lock().await;
                 if slot.is_empty()
@@ -236,10 +257,26 @@ async fn recipe_matches(
                 {
                     return None;
                 }
+                sherd_ids.push(slot.item.registry_key.to_string());
             }
+
+            // Build the block_entity_data NBT with the sherds list
+            let mut nbt = NbtCompound::new();
+            let sherd_tags: Vec<NbtTag> = sherd_ids
+                .into_iter()
+                .map(|s| NbtTag::String(s.into_boxed_str()))
+                .collect();
+            nbt.put("sherds", NbtTag::List(sherd_tags));
+
+            let block_entity_data = BlockEntityDataImpl { nbt };
+
             Some(RecipeResult {
                 item_id: "minecraft:decorated_pot".to_string(),
                 count: 1,
+                components: vec![(
+                    DataComponent::BlockEntityData,
+                    Some(Box::new(block_entity_data)),
+                )],
             })
         }
         GenericRecipe::Dynamic(OwnedCraftingRecipe::Shaped {
@@ -289,6 +326,7 @@ async fn recipe_matches(
             matched.then_some(RecipeResult {
                 item_id: result.item_id.clone(),
                 count: result.count,
+                components: Vec::new(),
             })
         }
         GenericRecipe::Dynamic(OwnedCraftingRecipe::Shapeless {
@@ -317,6 +355,7 @@ async fn recipe_matches(
             Some(RecipeResult {
                 item_id: result.item_id.clone(),
                 count: result.count,
+                components: Vec::new(),
             })
         }
         _ => None,
@@ -408,7 +447,11 @@ impl ResultSlot {
                 .unwrap_or(&matched.item_id);
             let item = pumpkin_data::item::Item::from_registry_key(key)
                 .unwrap_or(&pumpkin_data::item::Item::AIR);
-            ItemStack::new(matched.count, item)
+            if matched.components.is_empty() {
+                ItemStack::new(matched.count, item)
+            } else {
+                ItemStack::new_with_component(matched.count, item, matched.components)
+            }
         } else {
             ItemStack::EMPTY.clone()
         };
