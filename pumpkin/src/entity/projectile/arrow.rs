@@ -409,7 +409,14 @@ impl EntityBase for ArrowEntity {
                     }
 
                     target
-                        .damage(&*target, damage as f32, DamageType::ARROW)
+                        .damage_with_context(
+                            &*target,
+                            damage as f32,
+                            DamageType::ARROW,
+                            Some(hit_pos),
+                            None,
+                            Some(self),
+                        )
                         .await;
 
                     if target.get_living_entity().is_some() {
