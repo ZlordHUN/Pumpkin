@@ -13,8 +13,21 @@ impl DataComponentImpl for DyeImpl {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct DyedColorImpl;
+pub struct DyedColorImpl {
+    pub rgb: i32,
+}
+impl DyedColorImpl {
+    pub fn read_data(data: &NbtTag) -> Option<Self> {
+        data.extract_int().map(|rgb| Self { rgb })
+    }
+}
 impl DataComponentImpl for DyedColorImpl {
+    fn write_data(&self) -> NbtTag {
+        NbtTag::Int(self.rgb)
+    }
+    fn get_hash(&self) -> i32 {
+        get_i32_hash(self.rgb) as i32
+    }
     default_impl!(DyedColor);
 }
 
