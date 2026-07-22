@@ -847,7 +847,8 @@ impl JavaClient {
             return;
         }
         let pos = command.pos;
-        if let Some(block_entity) = player.world().get_block_entity(&pos) {
+        let block_entity = player.world().get_block_entity(&pos);
+        if let Some(block_entity) = block_entity {
             if block_entity.resource_location() != CommandBlockEntity::ID {
                 warn!("Client tried to change Command block but not Command block entity found");
                 return;
@@ -931,7 +932,8 @@ impl JavaClient {
             return;
         }
         let pos = jigsaw.pos;
-        if let Some(block_entity) = player.world().get_block_entity(&pos) {
+        let block_entity = player.world().get_block_entity(&pos);
+        if let Some(block_entity) = block_entity {
             if block_entity.resource_location() != JigsawBlockEntity::ID {
                 warn!("Client tried to change Jigsaw block but not Jigsaw block entity found");
                 return;
@@ -2623,8 +2625,10 @@ impl JavaClient {
         }
         let slot = slot as u8;
         let previous_slot = player.inventory.get_selected_slot();
-        if let Some(server) = player.world().server.upgrade() {
-            let Some(player_arc) = player.world().get_player_by_uuid(player.gameprofile.id) else {
+        let server = player.world().server.upgrade();
+        if let Some(server) = server {
+            let player_arc = player.world().get_player_by_uuid(player.gameprofile.id);
+            let Some(player_arc) = player_arc else {
                 return;
             };
             let event = PlayerItemHeldEvent::new(player_arc, previous_slot, slot);
