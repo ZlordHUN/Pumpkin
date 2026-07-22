@@ -10,6 +10,15 @@ use tracing::warn;
 
 use super::format::{ChunkSectionBiomes, ChunkSectionBlockStates};
 
+#[inline]
+fn bedrock_bits_per_entry(palette_len: usize) -> u8 {
+    match encompassing_bits(palette_len) {
+        bits @ 0..=6 => bits,
+        7 | 8 => 8,
+        _ => 16,
+    }
+}
+
 /// 3d array indexed by y,z,x
 type AbstractCube<T, const DIM: usize> = [[[T; DIM]; DIM]; DIM];
 
@@ -505,7 +514,7 @@ impl BiomePalette {
                 packed_data: Box::new([]),
             },
             Self::Heterogeneous(data) => {
-                let bits_per_entry = encompassing_bits(data.palette.len());
+                let bits_per_entry = bedrock_bits_per_entry(data.palette.len());
 
                 let key_to_index_map: HashMap<_, usize> = data
                     .palette
@@ -654,7 +663,7 @@ impl BlockPalette {
                 packed_data: Box::new([]),
             },
             Self::Heterogeneous(data) => {
-                let bits_per_entry = encompassing_bits(data.palette.len());
+                let bits_per_entry = bedrock_bits_per_entry(data.palette.len());
 
                 let key_to_index_map: HashMap<_, usize> = data
                     .palette
@@ -870,3 +879,18 @@ const BIOME_DISK_MIN_BITS: u8 = 0;
 const BIOME_NETWORK_MIN_MAP_BITS: u8 = 1;
 const BIOME_NETWORK_MAX_MAP_BITS: u8 = 3;
 pub(crate) const BIOME_NETWORK_MAX_BITS: u8 = 7;
+
+#[cfg(test)]
+mod tests {
+    use super::bedrock_bits_per_entry;
+
+    #[test]
+    fn bedrock_palette_uses_supported_storage_widths() {
+        assert_eq!(bedrock_bits_per_entry(2), 1);
+        assert_eq!(bedrock_bits_per_entry(64), 6);
+        assert_eq!(bedrock_bits_per_entry(65), 8);
+        assert_eq!(bedrock_bits_per_entry(256), 8);
+        assert_eq!(bedrock_bits_per_entry(257), 16);
+        assert_eq!(bedrock_bits_per_entry(4096), 16);
+    }
+}
