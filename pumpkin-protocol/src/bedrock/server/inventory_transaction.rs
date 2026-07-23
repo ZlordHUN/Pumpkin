@@ -63,33 +63,29 @@ pub struct InventoryAction {
 
 impl PacketRead for InventoryAction {
     fn read<R: Read>(buf: &mut R) -> Result<Self, Error> {
-        let source_type = VarULong::read(buf)?.0 as u32;
+        let source_type = VarUInt::read(buf)?.0;
 
-        let mut window_id = None;
-        let mut source_flags = None;
+        expect_present(buf, "inventory action window ID")?;
+        let window_id = if bool::read(buf)? {
+            Some(i32::from(i8::read(buf)?))
+        } else {
+            None
+        };
 
-        match InventoryActionSource::from(source_type) {
-            InventoryActionSource::Container | InventoryActionSource::Todo => {
-                window_id = Some(VarInt::read(buf)?.0);
-            }
-            InventoryActionSource::World => {
-                source_flags = Some(VarULong::read(buf)?.0 as u32);
-            }
-            _ => {}
-        }
-
-        let inventory_slot = VarULong::read(buf)?.0 as u32;
-
-        let old_item = NetworkItemDescriptor::read(buf)?;
-        let new_item = NetworkItemDescriptor::read(buf)?;
+        expect_present(buf, "inventory action source flags")?;
+        let source_flags = if bool::read(buf)? {
+            Some(VarUInt::read(buf)?.0)
+        } else {
+            None
+        };
 
         Ok(Self {
             source_type,
             window_id,
             source_flags,
-            inventory_slot,
-            old_item,
-            new_item,
+            inventory_slot: VarUInt::read(buf)?.0,
+            old_item: NetworkItemDescriptor::read(buf)?,
+            new_item: NetworkItemDescriptor::read(buf)?,
         })
     }
 }
@@ -136,7 +132,7 @@ impl PacketRead for UseItemTransactionData {
 #[derive(Debug)]
 pub struct UseItemOnEntityTransactionData {
     pub target_entity_runtime_id: VarULong,
-    pub action_type: VarUInt,
+    pub action_type: VarInt,
     pub hot_bar_slot: VarInt,
     pub item_in_hand: NetworkItemDescriptor,
     pub player_position: Vector3<f32>,
@@ -147,7 +143,7 @@ impl PacketRead for UseItemOnEntityTransactionData {
     fn read<R: Read>(buf: &mut R) -> Result<Self, Error> {
         Ok(Self {
             target_entity_runtime_id: VarULong::read(buf)?,
-            action_type: VarUInt::read(buf)?,
+            action_type: VarInt::read(buf)?,
             hot_bar_slot: VarInt::read(buf)?,
             item_in_hand: NetworkItemDescriptor::read(buf)?,
             player_position: Vector3::read(buf)?,
@@ -158,7 +154,7 @@ impl PacketRead for UseItemOnEntityTransactionData {
 
 #[derive(Debug)]
 pub struct ReleaseItemTransactionData {
-    pub action_type: VarUInt,
+    pub action_type: VarInt,
     pub hot_bar_slot: VarInt,
     pub item_in_hand: NetworkItemDescriptor,
     pub head_position: Vector3<f32>,
@@ -167,7 +163,7 @@ pub struct ReleaseItemTransactionData {
 impl PacketRead for ReleaseItemTransactionData {
     fn read<R: Read>(buf: &mut R) -> Result<Self, Error> {
         Ok(Self {
-            action_type: VarUInt::read(buf)?,
+            action_type: VarInt::read(buf)?,
             hot_bar_slot: VarInt::read(buf)?,
             item_in_hand: NetworkItemDescriptor::read(buf)?,
             head_position: Vector3::read(buf)?,
@@ -180,7 +176,6 @@ impl PacketRead for ReleaseItemTransactionData {
 pub struct SInventoryTransaction {
     pub legacy_request_id: VarInt,
     pub legacy_set_item_slots: Vec<LegacySetItemSlot>,
-    pub has_value: bool,
     pub actions: Vec<InventoryAction>,
     pub transaction_type: VarUInt,
     pub transaction_data: TransactionData,
@@ -199,18 +194,14 @@ impl PacketRead for SInventoryTransaction {
             }
         }
 
-        let _has_transaction_type = bool::read(buf)?;
+        expect_present(buf, "inventory transaction type")?;
         let transaction_type = VarUInt::read(buf)?;
 
-        let _has_tr_data = bool::read(buf)?;
-
-        let has_value = bool::read(buf)?;
-        let mut actions = Vec::new();
-        if has_value {
-            let actions_len = VarUInt::read(buf)?.0;
-            for _ in 0..actions_len {
-                actions.push(InventoryAction::read(buf)?);
-            }
+        expect_present(buf, "inventory transaction actions")?;
+        let actions_len = VarUInt::read(buf)?.0;
+        let mut actions = Vec::with_capacity(actions_len as usize);
+        for _ in 0..actions_len {
+            actions.push(InventoryAction::read(buf)?);
         }
 
         let transaction_data = match transaction_type.0 {
@@ -230,10 +221,67 @@ impl PacketRead for SInventoryTransaction {
         Ok(Self {
             legacy_request_id,
             legacy_set_item_slots,
-            has_value,
             actions,
             transaction_type,
             transaction_data,
         })
+    }
+}
+
+fn expect_present<R: Read>(buf: &mut R, field: &str) -> Result<(), Error> {
+    if bool::read(buf)? {
+        Ok(())
+    } else {
+        Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{field} is missing"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::serial::PacketWrite;
+
+    use super::*;
+
+    #[test]
+    fn decodes_entity_attack_transaction() {
+        let mut input = Vec::new();
+
+        VarInt(0).write(&mut input).unwrap();
+        false.write(&mut input).unwrap();
+        true.write(&mut input).unwrap();
+        VarUInt(3).write(&mut input).unwrap();
+        true.write(&mut input).unwrap();
+        VarUInt(1).write(&mut input).unwrap();
+
+        VarUInt(0).write(&mut input).unwrap();
+        true.write(&mut input).unwrap();
+        true.write(&mut input).unwrap();
+        0i8.write(&mut input).unwrap();
+        true.write(&mut input).unwrap();
+        false.write(&mut input).unwrap();
+        VarUInt(0).write(&mut input).unwrap();
+        NetworkItemDescriptor::default().write(&mut input).unwrap();
+        NetworkItemDescriptor::default().write(&mut input).unwrap();
+
+        VarULong(42).write(&mut input).unwrap();
+        VarInt(1).write(&mut input).unwrap();
+        VarInt(0).write(&mut input).unwrap();
+        NetworkItemDescriptor::default().write(&mut input).unwrap();
+        Vector3::new(1.0, 2.0, 3.0).write(&mut input).unwrap();
+        Vector3::new(0.0, 1.0, 0.0).write(&mut input).unwrap();
+
+        let packet = SInventoryTransaction::read(&mut Cursor::new(input)).unwrap();
+
+        assert_eq!(packet.actions.len(), 1);
+        let TransactionData::UseItemOnEntity(data) = packet.transaction_data else {
+            panic!("expected entity transaction");
+        };
+        assert_eq!(data.target_entity_runtime_id.0, 42);
+        assert_eq!(data.action_type.0, 1);
     }
 }
