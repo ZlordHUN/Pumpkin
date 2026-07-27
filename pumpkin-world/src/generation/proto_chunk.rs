@@ -3,6 +3,7 @@ use std::sync::Arc;
 use pumpkin_data::block_properties::is_air;
 use pumpkin_data::chunk::DoublePerlinNoiseParameters;
 use pumpkin_data::dimension::Dimension;
+use pumpkin_data::entity::EntityType;
 use pumpkin_data::fluid::{Fluid, FluidState};
 use pumpkin_data::structures::{
     Structure, StructureKeys, StructurePlacementType, StructureSet, WeightedEntry,
@@ -56,6 +57,7 @@ use crate::{
 };
 use pumpkin_data::tag::get_tag_ids;
 use pumpkin_nbt::compound::NbtCompound;
+use uuid::Uuid;
 
 use crate::tick::{ScheduledTick, TickPriority};
 
@@ -144,6 +146,7 @@ pub struct ProtoChunk {
     pub carving_mask: crate::generation::carver::mask::CarvingMask,
     pub blending_data: Option<crate::generation::blender::blending_data::BlendingData>,
     pub pending_block_entities: Vec<NbtCompound>,
+    pub pending_entities: Vec<NbtCompound>,
     pub fluid_ticks: Vec<ScheduledTick<&'static Fluid>>,
 }
 
@@ -229,6 +232,7 @@ impl ProtoChunk {
             ),
             blending_data: None,
             pending_block_entities: Vec::new(),
+            pending_entities: Vec::new(),
             fluid_ticks: Vec::new(),
         }
     }
@@ -341,6 +345,23 @@ impl ProtoChunk {
 
     pub fn take_pending_block_entities(&mut self) -> Vec<NbtCompound> {
         std::mem::take(&mut self.pending_block_entities)
+    }
+
+    pub fn add_entity(
+        &mut self,
+        entity_type: &'static EntityType,
+        position: Vector3<f64>,
+        mut nbt: NbtCompound,
+    ) {
+        nbt.put_string("id", format!("minecraft:{}", entity_type.resource_name));
+        nbt.put_uuid("UUID", Uuid::new_v4());
+        nbt.put_list(
+            "Pos",
+            vec![position.x.into(), position.y.into(), position.z.into()],
+        );
+        nbt.put_list("Motion", vec![0.0f64.into(), 0.0f64.into(), 0.0f64.into()]);
+        nbt.put_list("Rotation", vec![0.0f32.into(), 0.0f32.into()]);
+        self.pending_entities.push(nbt);
     }
 
     pub fn schedule_fluid_tick(&mut self, x: i32, y: i32, z: i32, fluid: &'static Fluid) {

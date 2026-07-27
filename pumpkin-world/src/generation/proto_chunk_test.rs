@@ -3,7 +3,50 @@ mod test {
     use crate::chunk_system::chunk_state::StagedChunkEnum;
     use crate::generation::{generator::WorldGenerator, get_world_gen, proto_chunk::ProtoChunk};
     use pumpkin_data::dimension::Dimension;
+    use pumpkin_data::entity::EntityType;
+    use pumpkin_nbt::compound::NbtCompound;
+    use pumpkin_util::math::vector3::Vector3;
     use pumpkin_util::world_seed::Seed;
+
+    #[test]
+    fn generated_entity_contains_persistent_base_nbt() {
+        let world_gen = get_world_gen(
+            Seed(42),
+            Dimension::OVERWORLD,
+            false,
+            Vec::new(),
+            String::new(),
+        );
+        let mut chunk = ProtoChunk::new(0, 0, &world_gen);
+        let position = Vector3::new(4.5, -20.5, 7.5);
+        let mut data = NbtCompound::new();
+        data.put_string(
+            "LootTable",
+            "minecraft:chests/abandoned_mineshaft".to_string(),
+        );
+
+        chunk.add_entity(&EntityType::CHEST_MINECART, position, data);
+
+        let [entity] = chunk.pending_entities.as_slice() else {
+            panic!("expected one generated entity");
+        };
+        assert_eq!(entity.get_string("id"), Some("minecraft:chest_minecart"));
+        assert!(entity.get_uuid("UUID").is_some());
+        assert_eq!(
+            entity.get_list("Pos").unwrap()[0].extract_double(),
+            Some(4.5)
+        );
+        assert_eq!(
+            entity.get_list("Pos").unwrap()[1].extract_double(),
+            Some(-20.5)
+        );
+        assert_eq!(
+            entity.get_list("Pos").unwrap()[2].extract_double(),
+            Some(7.5)
+        );
+        assert_eq!(entity.get_list("Motion").unwrap().len(), 3);
+        assert_eq!(entity.get_list("Rotation").unwrap().len(), 2);
+    }
 
     #[test]
     fn no_blend_no_beard_0_0() {

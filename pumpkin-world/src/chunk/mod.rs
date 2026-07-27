@@ -77,6 +77,7 @@ pub struct ChunkData {
     pub block_ticks: ChunkTickScheduler<&'static Block>,
     pub fluid_ticks: ChunkTickScheduler<&'static Fluid>,
     pub pending_block_entities: std::sync::Mutex<FxHashMap<BlockPos, NbtCompound>>,
+    pub pending_entities: std::sync::Mutex<Vec<NbtCompound>>,
     pub light_engine: std::sync::Mutex<ChunkLight>,
     pub light_populated: AtomicBool,
     pub status: ChunkStatus,
