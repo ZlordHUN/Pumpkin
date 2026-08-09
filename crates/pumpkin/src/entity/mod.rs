@@ -369,6 +369,20 @@ pub trait EntityBase: Send + Sync + std::any::Any {
 
     fn send_java_spawn_packet(&self, client: &JavaClient) {
         let entity = self.get_entity();
+        if let Some(player) = self.get_player()
+            && player.uses_bedrock_mannequin(client)
+        {
+            World::send_java_player_spawn(
+                client,
+                player,
+                entity.pos.load(),
+                entity.pitch.load(),
+                entity.yaw.load(),
+                entity.head_yaw.load(),
+                entity.velocity.load(),
+            );
+            return;
+        }
         let version = client.version.load();
         let is_mob = entity.entity_type.mob || self.get_mob().is_some();
         let metadata = self.java_spawn_metadata(version);
@@ -3110,17 +3124,48 @@ impl Entity {
         let recipients_by_version =
             World::collect_java_recipients_by_version(java_recipients.into_iter());
 
+        let subject = if self.entity_type == &EntityType::PLAYER {
+            world.get_player_by_id(self.entity_id)
+        } else {
+            None
+        };
         for (version, recipients) in recipients_by_version {
             // TODO: Support older versions
             if version < JavaMinecraftVersion::V_26_2 {
                 continue;
             }
-            if let Some(buf) = self.synched_data.pack_dirty_for_version(&version) {
-                let packet = CSetEntityMetadata::new(self.entity_id.into(), buf);
-                if let Ok(packet_data) = JavaClient::serialize_packet_for_version(&packet, version)
-                {
-                    for recipient in recipients {
-                        recipient.try_enqueue_packet(packet_data.clone());
+            let (mannequin_recipients, player_recipients): (Vec<_>, Vec<_>) = if let Some(subject) =
+                subject.as_ref()
+                && matches!(subject.client.as_ref(), ClientPlatform::Bedrock(_))
+            {
+                recipients
+                    .into_iter()
+                    .partition(|recipient| subject.uses_bedrock_mannequin(recipient))
+            } else {
+                (Vec::new(), recipients)
+            };
+            for (recipients, mannequin) in
+                [(player_recipients, false), (mannequin_recipients, true)]
+            {
+                if recipients.is_empty() {
+                    continue;
+                }
+                let metadata = if mannequin {
+                    self.synched_data.pack_dirty_for_version_filtered(
+                        &version,
+                        player::mannequin_shared_metadata,
+                    )
+                } else {
+                    self.synched_data.pack_dirty_for_version(&version)
+                };
+                if let Some(buf) = metadata {
+                    let packet = CSetEntityMetadata::new(self.entity_id.into(), buf);
+                    if let Ok(packet_data) =
+                        JavaClient::serialize_packet_for_version(&packet, version)
+                    {
+                        for recipient in recipients {
+                            recipient.try_enqueue_packet(packet_data.clone());
+                        }
                     }
                 }
             }

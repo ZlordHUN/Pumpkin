@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::net::ClientPlatform;
 use pumpkin_data::entity::EntityPose;
 
 impl BedrockClient {
@@ -41,6 +42,19 @@ impl BedrockClient {
 
         if pos_changed || rot_changed {
             let world = player.world();
+            let mannequin_viewers: Vec<_> = world
+                .players
+                .load()
+                .iter()
+                .filter(|viewer| {
+                    matches!(viewer.client.as_ref(), ClientPlatform::Java(client)
+                        if player.uses_bedrock_mannequin(client))
+                })
+                .cloned()
+                .collect();
+            let mut relative_exclusions = vec![player.gameprofile.id];
+            relative_exclusions
+                .extend(mannequin_viewers.iter().map(|viewer| viewer.gameprofile.id));
 
             if pos_changed {
                 player.get_entity().set_pos(new_pos);
@@ -78,20 +92,21 @@ impl BedrockClient {
             );
 
             if pos_changed && delta.length_squared() >= 64.0 {
-                world.broadcast_packet_except(
-                    &[player.gameprofile.id],
+                world.broadcast_packet_except_editioned(
+                    &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CEntityPositionSync::new(
                         player.entity_id().into(),
                         new_pos,
                         pumpkin_util::math::vector3::Vector3::new(0.0, 0.0, 0.0),
-                        je_yaw,
-                        je_pitch,
+                        new_yaw,
+                        new_pitch,
                         on_ground,
                     ),
+                    &bedrock_move_packet,
                 );
             } else if pos_changed && rot_changed {
                 world.broadcast_packet_except_editioned(
-                    &[player.gameprofile.id],
+                    &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityPosRot::new(
                         player.entity_id().into(),
                         pumpkin_util::math::vector3::Vector3::new(
@@ -107,7 +122,7 @@ impl BedrockClient {
                 );
             } else if pos_changed {
                 world.broadcast_packet_except_editioned(
-                    &[player.gameprofile.id],
+                    &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityPos::new(
                         player.entity_id().into(),
                         pumpkin_util::math::vector3::Vector3::new(
@@ -121,7 +136,7 @@ impl BedrockClient {
                 );
             } else if rot_changed {
                 world.broadcast_packet_except_editioned(
-                    &[player.gameprofile.id],
+                    &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityRot::new(
                         player.entity_id().into(),
                         je_yaw as u8,   // Use converted Java byte
@@ -130,6 +145,24 @@ impl BedrockClient {
                     ),
                     &bedrock_move_packet,
                 );
+            }
+
+            // Mannequins do not share the normal player movement prediction. Keep
+            // their authoritative position in sync without changing legacy clients.
+            if let Some(tracked) = world.entity_tracker.get_tracked_entity(player.entity_id()) {
+                let movement = pumpkin_protocol::java::client::play::CEntityPositionSync::new(
+                    player.entity_id().into(),
+                    new_pos,
+                    packet.delta.to_f64(),
+                    new_yaw,
+                    new_pitch,
+                    on_ground,
+                );
+                for viewer in mannequin_viewers {
+                    if tracked.seen_by.contains(&viewer.gameprofile.id) {
+                        viewer.try_send_client_packet(&movement);
+                    }
+                }
             }
 
             if rot_changed {

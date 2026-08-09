@@ -1,5 +1,6 @@
 pub mod nethernet;
 pub mod play;
+pub mod skin_pack;
 pub mod status;
 use crossbeam::atomic::AtomicCell;
 use std::{
@@ -35,8 +36,8 @@ use pumpkin_protocol::{
             interact::SInteract, inventory_transaction::SInventoryTransaction,
             loading_screen::SLoadingScreen, login::SLogin, mob_equipment::SMobEquipment,
             packet_violation_warning::SPacketViolationWarning, player_action::SPlayerAction,
-            player_auth_input::SPlayerAuthInput, request_ability::SRequestAbility,
-            request_chunk_radius::SRequestChunkRadius,
+            player_auth_input::SPlayerAuthInput, player_skin::SPlayerSkin,
+            request_ability::SRequestAbility, request_chunk_radius::SRequestChunkRadius,
             request_network_settings::SRequestNetworkSettings,
             resource_pack_client_response::SResourcePackClientResponse, respawn::SRespawn,
             set_local_player_as_initialized::SSetLocalPlayerAsInitialized,
@@ -740,6 +741,15 @@ impl BedrockClient {
             SRespawn::PACKET_ID => {
                 let packet = SRespawn::read(reader)?;
                 self.handle_respawn(player, &packet);
+            }
+            SPlayerSkin::PACKET_ID => {
+                let packet = SPlayerSkin::read(reader)?;
+                let client = self.clone();
+                let player = player.clone();
+                let server_c = server.clone();
+                server.spawn_task(async move {
+                    client.handle_player_skin(&player, &server_c, packet).await;
+                });
             }
             SAnimate::PACKET_ID => {
                 self.handle_animate(player, &SAnimate::read(reader)?);

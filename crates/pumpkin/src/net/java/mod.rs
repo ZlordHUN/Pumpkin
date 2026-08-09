@@ -61,7 +61,7 @@ pub mod play;
 pub mod recipe_helper;
 pub mod status;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use pending::PendingConnection;
 
 use crate::entity::player::Player;
@@ -89,6 +89,8 @@ pub struct JavaClient {
     pub brand: ArcSwap<Option<String>>,
     /// Associated player reference. Lock-free `ArcSwap`.
     pub player: ArcSwap<Option<Arc<Player>>>,
+    /// Aggregate Bedrock skin pack loaded for this Java session.
+    pub bedrock_skin_pack: ArcSwapOption<crate::net::bedrock::skin_pack::BedrockSkinPack>,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
@@ -246,6 +248,7 @@ impl JavaClient {
             network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
             brand: ArcSwap::from_pointee(pending.brand),
             player: ArcSwap::from_pointee(None),
+            bedrock_skin_pack: ArcSwapOption::from(pending.bedrock_skin_pack),
             wait_for_keep_alive: AtomicBool::new(false),
             keep_alive_id: AtomicCell::new(0),
             last_keep_alive_time: AtomicCell::new(Instant::now()),

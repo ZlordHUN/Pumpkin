@@ -201,13 +201,19 @@ impl TrackedEntity {
 
         if let ClientPlatform::Java(client) = player.client.as_ref() {
             let version = client.version.load();
+            let mannequin = self
+                .entity
+                .get_player()
+                .is_some_and(|subject| subject.uses_bedrock_mannequin(client));
             // TODO: Support older versions
             if version >= JavaMinecraftVersion::V_26_2
                 && let Some(non_default) = self
                     .entity
                     .get_entity()
                     .synched_data
-                    .get_non_default_values_for_version(&version)
+                    .get_non_default_values_for_version_filtered(&version, |data| {
+                        !mannequin || crate::entity::player::mannequin_shared_metadata(data)
+                    })
             {
                 let packet = CSetEntityMetadata::new(self.entity_id.into(), non_default);
                 if let Ok(packet_data) = JavaClient::serialize_packet_for_version(&packet, version)

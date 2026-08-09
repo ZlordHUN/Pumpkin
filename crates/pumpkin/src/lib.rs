@@ -345,6 +345,9 @@ impl PumpkinServer {
 
         let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
         let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
+        server
+            .bedrock_skin_pack_endpoint
+            .store(nethernet_listener.is_some(), Ordering::Release);
 
         Self {
             server,
@@ -384,6 +387,7 @@ impl PumpkinServer {
             config.online_mode,
             oidc_verifier,
             config.nethernet.stun_servers.clone(),
+            server.bedrock_skin_packs.clone(),
         )
         .await
         {

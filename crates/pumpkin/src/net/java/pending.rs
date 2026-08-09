@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZero, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, num::NonZero, sync::Arc};
 
 use bytes::Bytes;
 use crossbeam::atomic::AtomicCell;
@@ -68,6 +68,8 @@ pub struct PendingConnection {
     pub brand: Option<String>,
     pub packet_limiter: PacketRateLimiter,
     pub verify_token: Option<[u8; 4]>,
+    pub bedrock_skin_pack: Option<Arc<crate::net::bedrock::skin_pack::BedrockSkinPack>>,
+    pub pending_resource_packs: HashSet<uuid::Uuid>,
 }
 
 impl PendingConnection {
@@ -93,6 +95,8 @@ impl PendingConnection {
             brand: None,
             packet_limiter,
             verify_token: None,
+            bedrock_skin_pack: None,
+            pending_resource_packs: HashSet::new(),
         }
     }
 
@@ -501,13 +505,38 @@ impl PendingConnection {
         server: &Server,
         packet: SConfigResourcePack,
     ) {
+        use pumpkin_protocol::java::server::config::ResourcePackResponseResult;
+
+        let result = packet.response_result();
+        if matches!(
+            result,
+            ResourcePackResponseResult::Accepted | ResourcePackResponseResult::Downloaded
+        ) {
+            return;
+        }
+
         let resource_config = &server.advanced_config.resource_pack.java;
-        if resource_config.enabled {
-            use pumpkin_protocol::java::server::config::ResourcePackResponseResult;
-            match packet.response_result() {
-                ResourcePackResponseResult::Downloaded
-                | ResourcePackResponseResult::DownloadSuccess
-                | ResourcePackResponseResult::Accepted
+        let java_pack_id = resource_config.enabled.then(|| {
+            uuid::Uuid::new_v3(&uuid::Uuid::NAMESPACE_DNS, resource_config.url.as_bytes())
+        });
+        let response_id =
+            configuration_resource_pack_id(self.version.load(), packet.uuid, java_pack_id);
+        // Only an offered pack's first terminal response can advance configuration.
+        if !self.pending_resource_packs.remove(&response_id) {
+            warn!(pack = %packet.uuid, ?result, "Java client answered a configuration resource pack that is not pending");
+            return;
+        }
+        let is_skin_pack = self
+            .bedrock_skin_pack
+            .as_ref()
+            .is_some_and(|pack| pack.id == response_id);
+        if is_skin_pack {
+            if result != ResourcePackResponseResult::DownloadSuccess {
+                self.bedrock_skin_pack = None;
+            }
+        } else if java_pack_id == Some(response_id) {
+            match result {
+                ResourcePackResponseResult::DownloadSuccess
                 | ResourcePackResponseResult::Discarded
                 | ResourcePackResponseResult::Unknown(_) => {}
                 ResourcePackResponseResult::Declined => {
@@ -530,7 +559,17 @@ impl PendingConnection {
                     self.kick(TextComponent::text("Failed to reload resource pack"))
                         .await;
                 }
+                ResourcePackResponseResult::Downloaded | ResourcePackResponseResult::Accepted => {
+                    return;
+                }
             }
+        } else {
+            warn!(pack = %packet.uuid, ?result, "Java client answered an unknown configuration resource pack");
+            return;
+        }
+
+        if self.pending_resource_packs.is_empty() && !self.is_closed() {
+            self.continue_configuration_after_resource_packs().await;
         }
     }
 
@@ -539,6 +578,41 @@ impl PendingConnection {
             "Received cookie_response[config]: key: \"{}\", payload_length: \"{:?}\"",
             packet.key,
             packet.payload.as_ref().map(|p| p.len())
+        );
+    }
+}
+
+fn configuration_resource_pack_id(
+    version: JavaMinecraftVersion,
+    response_id: uuid::Uuid,
+    configured_id: Option<uuid::Uuid>,
+) -> uuid::Uuid {
+    if version < JavaMinecraftVersion::V_1_20_3 {
+        configured_id.unwrap_or(response_id)
+    } else {
+        response_id
+    }
+}
+
+#[cfg(test)]
+mod resource_pack_tests {
+    use super::*;
+
+    #[test]
+    fn configuration_resource_pack_ids_preserve_legacy_and_multi_pack_responses() {
+        let configured = uuid::Uuid::from_u128(1);
+        let skin = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            configuration_resource_pack_id(
+                JavaMinecraftVersion::V_1_20_2,
+                uuid::Uuid::nil(),
+                Some(configured),
+            ),
+            configured,
+        );
+        assert_eq!(
+            configuration_resource_pack_id(JavaMinecraftVersion::V_26_2, skin, Some(configured),),
+            skin,
         );
     }
 }
