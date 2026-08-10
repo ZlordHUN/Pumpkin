@@ -1,5 +1,5 @@
 use pumpkin_protocol::java::client::play::{
-    CChunkBatchEnd, CChunkBatchStart, CChunkData, CLightUpdate, CPlayDisconnect,
+    CAddResourcePack, CChunkBatchEnd, CChunkBatchStart, CChunkData, CLightUpdate, CPlayDisconnect,
 };
 use pumpkin_world::level::SyncChunk;
 use std::net::SocketAddr;
@@ -91,6 +91,11 @@ pub struct JavaClient {
     pub player: ArcSwap<Option<Arc<Player>>>,
     /// Aggregate Bedrock skin pack loaded for this Java session.
     pub bedrock_skin_pack: ArcSwapOption<crate::net::bedrock::skin_pack::BedrockSkinPack>,
+    /// A newer aggregate Bedrock skin pack currently being downloaded.
+    pending_bedrock_skin_pack:
+        tokio::sync::Mutex<Option<Arc<crate::net::bedrock::skin_pack::BedrockSkinPack>>>,
+    /// Actual proxy actors presented to this client, separate from pack eligibility.
+    pub(crate) bedrock_mannequins: std::sync::Mutex<std::collections::HashSet<i32>>,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
@@ -249,6 +254,8 @@ impl JavaClient {
             brand: ArcSwap::from_pointee(pending.brand),
             player: ArcSwap::from_pointee(None),
             bedrock_skin_pack: ArcSwapOption::from(pending.bedrock_skin_pack),
+            pending_bedrock_skin_pack: tokio::sync::Mutex::new(None),
+            bedrock_mannequins: std::sync::Mutex::new(std::collections::HashSet::new()),
             wait_for_keep_alive: AtomicBool::new(false),
             keep_alive_id: AtomicCell::new(0),
             last_keep_alive_time: AtomicCell::new(Instant::now()),
@@ -261,6 +268,55 @@ impl JavaClient {
 
     pub fn set_player(&self, player: Arc<Player>) {
         self.player.store(Arc::new(Some(player)));
+    }
+
+    pub async fn push_bedrock_skin_pack(
+        &self,
+        server: &Server,
+        pack: Arc<crate::net::bedrock::skin_pack::BedrockSkinPack>,
+    ) {
+        let config = &server.advanced_config.networking.bedrock.skins;
+        if !config.java_resource_pack
+            || !server.bedrock_skin_pack_endpoint.load(Ordering::Acquire)
+            || self.version.load() < JavaMinecraftVersion::V_26_1
+            || self.is_closed()
+        {
+            return;
+        }
+
+        // Admission and completion share this lock: concurrent skin changes cannot
+        // overwrite an outstanding offer or leave an untracked pack on the client.
+        let mut pending = self.pending_bedrock_skin_pack.lock().await;
+        if pending.is_some() {
+            return;
+        }
+        // A previous broadcast may have waited behind a newer one.
+        let pack = server.bedrock_skin_packs.current().await.unwrap_or(pack);
+        if self
+            .bedrock_skin_pack
+            .load_full()
+            .is_some_and(|loaded| loaded.id == pack.id)
+        {
+            return;
+        }
+        let port = server
+            .advanced_config
+            .networking
+            .bedrock
+            .nethernet
+            .address
+            .port();
+        let url = crate::net::bedrock::skin_pack::resource_url(
+            &self.server_address,
+            port,
+            config.resource_pack_url.as_deref(),
+            pack.id,
+        );
+        let packet = CAddResourcePack::new(&pack.id, &url, &pack.hash, false, None);
+        if let Ok(data) = self.serialize_packet(&packet) {
+            *pending = Some(pack);
+            self.enqueue_packet(data).await;
+        }
     }
 
     pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {

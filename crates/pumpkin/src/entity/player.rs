@@ -625,8 +625,8 @@ pub(crate) fn mannequin_shared_metadata(data: pumpkin_data::tracked_data::Tracke
 }
 
 impl Player {
-    /// Whether this Java session represents this Bedrock player with a skin-pack mannequin.
-    pub(crate) fn uses_bedrock_mannequin(&self, client: &JavaClient) -> bool {
+    /// Whether the loaded resource pack can represent this player with a mannequin.
+    pub(crate) fn can_use_bedrock_mannequin(&self, client: &JavaClient) -> bool {
         matches!(self.client.as_ref(), ClientPlatform::Bedrock(_))
             && client.version.load() >= JavaMinecraftVersion::V_26_1
             && client
@@ -634,6 +634,15 @@ impl Player {
                 .load()
                 .as_ref()
                 .is_some_and(|pack| pack.skin(self.gameprofile.id).is_some())
+    }
+
+    /// The actor type last queued for this session, which may lag behind a pack change.
+    pub(crate) fn uses_bedrock_mannequin(&self, client: &JavaClient) -> bool {
+        client
+            .bedrock_mannequins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&self.entity_id())
     }
 
     fn fetch_bedrock_skin(

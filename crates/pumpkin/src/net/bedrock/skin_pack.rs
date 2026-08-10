@@ -827,9 +827,7 @@ mod tests {
         let packs = BedrockSkinPacks::default();
         let player_id = Uuid::new_v4();
         let skin = Skin::steve();
-        let (_, changed) = packs
-            .accept(player_id, skin.clone(), true, Duration::from_mins(1))
-            .await;
+        let (_, changed) = packs.accept(player_id, skin.clone(), true, Duration::from_mins(1));
         assert!(changed);
 
         let mut with_cape = skin.clone();
@@ -838,9 +836,7 @@ mod tests {
         with_cape.cape_data = vec![0x7f; 64 * 32 * 4];
         with_cape.cape_id = "delayed-cape".to_string();
         with_cape.profile_hash = "appearance-with-cape".to_string();
-        let (accepted, changed) = packs
-            .accept(player_id, with_cape, true, Duration::from_mins(1))
-            .await;
+        let (accepted, changed) = packs.accept(player_id, with_cape, true, Duration::from_mins(1));
         assert!(changed);
         assert!(has_cape(&accepted));
         assert!(
@@ -852,7 +848,7 @@ mod tests {
                 .is_some()
         );
 
-        let (preserved, changed) = packs.accept(player_id, skin, true, Duration::ZERO).await;
+        let (preserved, changed) = packs.accept(player_id, skin, true, Duration::ZERO);
         assert!(!changed);
         assert!(has_cape(&preserved));
     }

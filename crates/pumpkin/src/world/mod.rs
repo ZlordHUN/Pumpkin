@@ -2583,14 +2583,17 @@ impl World {
         velocity: Vector3<f64>,
     ) {
         let version = client.version.load();
+        // Coordinate the queued actor type with concurrent metadata updates. The
+        // resource-pack state can change before its asynchronous actor refresh runs.
+        let mut presentation = client
+            .bedrock_mannequins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pack = client.bedrock_skin_pack.load_full();
         let skin = pack
             .as_ref()
             .and_then(|pack| pack.skin(subject.gameprofile.id))
-            .filter(|_| {
-                matches!(subject.client.as_ref(), ClientPlatform::Bedrock(_))
-                    && version >= JavaMinecraftVersion::V_26_1
-            });
+            .filter(|_| subject.can_use_bedrock_mannequin(client));
         let entity_type = if skin.is_some() {
             EntityType::MANNEQUIN
         } else {
@@ -2608,21 +2611,28 @@ impl World {
             velocity,
         );
         if let Ok(data) = client.serialize_packet(&spawn) {
+            if skin.is_some() {
+                presentation.insert(subject.entity_id());
+            } else {
+                presentation.remove(&subject.entity_id());
+            }
             client.try_enqueue_packet(data);
         }
+        if version < JavaMinecraftVersion::V_1_21 {
+            return;
+        }
+        let mut metadata = subject
+            .get_entity()
+            .synched_data
+            .get_non_default_values_for_version_filtered(&version, |data| {
+                skin.is_none() || crate::entity::player::mannequin_shared_metadata(data)
+            })
+            .map_or_else(Vec::new, |data| {
+                let mut data = data.into_vec();
+                data.pop();
+                data
+            });
         if let Some(skin) = skin {
-            let mut metadata = subject
-                .get_entity()
-                .synched_data
-                .get_non_default_values_for_version_filtered(
-                    &version,
-                    crate::entity::player::mannequin_shared_metadata,
-                )
-                .map_or_else(Vec::new, |data| {
-                    let mut data = data.into_vec();
-                    data.pop();
-                    data
-                });
             let _ = Metadata::new(
                 pumpkin_data::tracked_data::mannequin::PROFILE,
                 MannequinProfile {
@@ -2639,21 +2649,23 @@ impl World {
             // The real Bedrock player supplies the movement; the Java proxy must not fall.
             let _ = Metadata::new(pumpkin_data::tracked_data::mannequin::NO_GRAVITY, true)
                 .write(&mut metadata, &version);
-            let _ = Metadata::new(
-                pumpkin_data::tracked_data::mannequin::SHARED_FLAGS,
-                subject.get_entity().flags.load(Ordering::Relaxed),
-            )
-            .write(&mut metadata, &version);
-            let _ = Metadata::new(
-                pumpkin_data::tracked_data::mannequin::PLAYER_MODE_CUSTOMISATION,
-                subject.config.load().skin_parts,
-            )
-            .write(&mut metadata, &version);
-            metadata.put_u8(255);
-            let packet = CSetEntityMetadata::new(subject.entity_id().into(), metadata.into());
-            if let Ok(data) = client.serialize_packet(&packet) {
-                client.try_enqueue_packet(data);
-            }
+        }
+        let _ = Metadata::new(
+            pumpkin_data::tracked_data::player::SHARED_FLAGS,
+            subject.get_entity().flags.load(Ordering::Relaxed),
+        )
+        .write(&mut metadata, &version);
+        let _ = Metadata::new(
+            pumpkin_data::tracked_data::player::PLAYER_MODE_CUSTOMISATION,
+            subject.config.load().skin_parts,
+        )
+        .write(&mut metadata, &version);
+        metadata.put_u8(255);
+        let packet = CSetEntityMetadata::new(subject.entity_id().into(), metadata.into());
+        if let Ok(data) = client.serialize_packet(&packet) {
+            client.try_enqueue_packet(data);
+        }
+        if skin.is_some() {
             let sync = CEntityPositionSync::new(
                 subject.entity_id().into(),
                 position,
@@ -2713,34 +2725,6 @@ impl World {
                 entity.head_yaw.load(),
                 entity.velocity.load(),
             );
-            if !subject.uses_bedrock_mannequin(client) {
-                let version = client.version.load();
-                let mut metadata = entity
-                    .synched_data
-                    .get_non_default_values_for_version(&version)
-                    .map_or_else(Vec::new, |data| {
-                        let mut data = data.into_vec();
-                        data.pop();
-                        data
-                    });
-                let _ = Metadata::new(
-                    pumpkin_data::tracked_data::player::PLAYER_MODE_CUSTOMISATION,
-                    subject.config.load().skin_parts,
-                )
-                .write(&mut metadata, &version);
-                let _ = Metadata::new(
-                    pumpkin_data::tracked_data::player::SHARED_FLAGS,
-                    entity.flags.load(Ordering::Relaxed),
-                )
-                .write(&mut metadata, &version);
-                metadata.put_u8(255);
-                client
-                    .enqueue_client_packet(&CSetEntityMetadata::new(
-                        subject.entity_id().into(),
-                        metadata.into(),
-                    ))
-                    .await;
-            }
             let mut equipment = vec![(
                 EquipmentSlot::MAIN_HAND.discriminant(),
                 subject.inventory.held_item(),
@@ -2792,10 +2776,17 @@ impl World {
             (weather.rain_level, weather.thunder_level)
         };
         let runtime_id = player.entity_id() as u64;
+        let previous_skin_pack = server.bedrock_skin_packs.current().await;
         let _ = server
             .bedrock_skin_packs
             .register(player.gameprofile.id, &player.bedrock_skin.load())
             .await;
+        if let Some(pack) = server.bedrock_skin_packs.current().await
+            && previous_skin_pack.as_ref().map(|pack| pack.id) != Some(pack.id)
+        {
+            server.push_bedrock_skin_pack(pack).await;
+        }
+
         let (position, yaw, pitch) = if player.has_played_before.load(Ordering::Relaxed) {
             let position = player.position();
             let yaw = player.get_entity().yaw.load(); //info.spawn_angle;
@@ -5288,10 +5279,26 @@ impl World {
 
             self.broadcast_editioned(&CRemovePlayerInfo::new(&[uuid]), &bedrock_remove_player);
 
-            self.broadcast_editioned(
-                &CRemoveEntities::new(&[entity_id.into()]),
-                &CRemoveActor::new(VarLong(entity_id as i64)),
-            );
+            let entity_ids = [entity_id.into()];
+            let java_remove = CRemoveEntities::new(&entity_ids);
+            let bedrock_remove = CRemoveActor::new(VarLong(entity_id as i64));
+            for recipient in self.players.load().iter() {
+                match recipient.client.as_ref() {
+                    ClientPlatform::Java(client) => {
+                        let mut presentation = client
+                            .bedrock_mannequins
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Ok(data) = client.serialize_packet(&java_remove) {
+                            presentation.remove(&entity_id);
+                            client.try_enqueue_packet(data);
+                        }
+                    }
+                    ClientPlatform::Bedrock(client) => {
+                        client.try_enqueue_client_packet(&bedrock_remove)
+                    }
+                }
+            }
 
             if fire_event {
                 let msg_comp = TextComponent::translate_cross(

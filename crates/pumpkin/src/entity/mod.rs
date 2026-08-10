@@ -370,7 +370,7 @@ pub trait EntityBase: Send + Sync + std::any::Any {
     fn send_java_spawn_packet(&self, client: &JavaClient) {
         let entity = self.get_entity();
         if let Some(player) = self.get_player()
-            && player.uses_bedrock_mannequin(client)
+            && matches!(player.client.as_ref(), ClientPlatform::Bedrock(_))
         {
             World::send_java_player_spawn(
                 client,
@@ -3124,49 +3124,50 @@ impl Entity {
         let recipients_by_version =
             World::collect_java_recipients_by_version(java_recipients.into_iter());
 
-        let subject = if self.entity_type == &EntityType::PLAYER {
-            world.get_player_by_id(self.entity_id)
-        } else {
-            None
-        };
+        let bedrock_player = self.entity_type == &EntityType::PLAYER
+            && world
+                .get_player_by_id(self.entity_id)
+                .is_some_and(|subject| {
+                    matches!(subject.client.as_ref(), ClientPlatform::Bedrock(_))
+                });
         for (version, recipients) in recipients_by_version {
             // TODO: Support older versions
             if version < JavaMinecraftVersion::V_26_2 {
                 continue;
             }
-            let (mannequin_recipients, player_recipients): (Vec<_>, Vec<_>) = if let Some(subject) =
-                subject.as_ref()
-                && matches!(subject.client.as_ref(), ClientPlatform::Bedrock(_))
-            {
-                recipients
-                    .into_iter()
-                    .partition(|recipient| subject.uses_bedrock_mannequin(recipient))
-            } else {
-                (Vec::new(), recipients)
+            let serialize = |metadata: Option<Box<[u8]>>| {
+                metadata.and_then(|buf| {
+                    JavaClient::serialize_packet_for_version(
+                        &CSetEntityMetadata::new(self.entity_id.into(), buf),
+                        version,
+                    )
+                    .ok()
+                })
             };
-            for (recipients, mannequin) in
-                [(player_recipients, false), (mannequin_recipients, true)]
-            {
-                if recipients.is_empty() {
-                    continue;
-                }
-                let metadata = if mannequin {
-                    self.synched_data.pack_dirty_for_version_filtered(
+            let normal = serialize(self.synched_data.pack_dirty_for_version(&version));
+            if bedrock_player {
+                let mannequin =
+                    serialize(self.synched_data.pack_dirty_for_version_filtered(
                         &version,
                         player::mannequin_shared_metadata,
-                    )
-                } else {
-                    self.synched_data.pack_dirty_for_version(&version)
-                };
-                if let Some(buf) = metadata {
-                    let packet = CSetEntityMetadata::new(self.entity_id.into(), buf);
-                    if let Ok(packet_data) =
-                        JavaClient::serialize_packet_for_version(&packet, version)
-                    {
-                        for recipient in recipients {
-                            recipient.try_enqueue_packet(packet_data.clone());
-                        }
+                    ));
+                for recipient in recipients {
+                    let presentation = recipient
+                        .bedrock_mannequins
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let packet = if presentation.contains(&self.entity_id) {
+                        &mannequin
+                    } else {
+                        &normal
+                    };
+                    if let Some(packet) = packet {
+                        recipient.try_enqueue_packet(packet.clone());
                     }
+                }
+            } else if let Some(packet) = normal {
+                for recipient in recipients {
+                    recipient.try_enqueue_packet(packet.clone());
                 }
             }
         }
