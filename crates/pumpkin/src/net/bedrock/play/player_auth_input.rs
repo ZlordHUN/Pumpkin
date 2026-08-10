@@ -33,12 +33,16 @@ impl BedrockClient {
 
         let new_pitch = packet.pitch;
         let new_yaw = packet.yaw;
+        let new_head_yaw = packet.head_yaw;
 
         let old_pitch = entity.pitch.load();
         let old_yaw = entity.yaw.load();
+        let old_head_yaw = entity.head_yaw.load();
 
         let pos_changed = new_pos != old_pos;
-        let rot_changed = new_pitch != old_pitch || new_yaw != old_yaw;
+        let body_rot_changed = new_pitch != old_pitch || new_yaw != old_yaw;
+        let head_rot_changed = new_head_yaw != old_head_yaw;
+        let rot_changed = body_rot_changed || head_rot_changed;
 
         if pos_changed || rot_changed {
             let world = player.world();
@@ -59,13 +63,17 @@ impl BedrockClient {
             if pos_changed {
                 player.get_entity().set_pos(new_pos);
             }
-            if rot_changed {
+            if body_rot_changed {
                 entity.pitch.store(new_pitch);
                 entity.yaw.store(new_yaw);
+            }
+            if head_rot_changed {
+                entity.head_yaw.store(new_head_yaw);
             }
 
             let je_yaw = (new_yaw * 256.0 / 360.0).rem_euclid(256.0);
             let je_pitch = (new_pitch * 256.0 / 360.0).rem_euclid(256.0);
+            let je_head_yaw = (new_head_yaw * 256.0 / 360.0).rem_euclid(256.0);
 
             let delta = pumpkin_util::math::vector3::Vector3::new(
                 new_pos.x - old_pos.x,
@@ -82,7 +90,7 @@ impl BedrockClient {
                 ),
                 new_pitch,
                 new_yaw,
-                new_yaw, // Head yaw
+                new_head_yaw,
                 pumpkin_protocol::bedrock::client::CMovePlayer::MODE_NORMAL,
                 on_ground,
                 pumpkin_protocol::codec::var_ulong::VarULong(0),
@@ -165,13 +173,12 @@ impl BedrockClient {
                 }
             }
 
-            if rot_changed {
+            if head_rot_changed {
                 world.broadcast_packet_except(
                     &[player.gameprofile.id],
-                    // Adjust to `CHeadRot` if that is what your crate currently calls it
                     &pumpkin_protocol::java::client::play::CHeadRot::new(
                         player.entity_id().into(),
-                        je_yaw as u8,
+                        je_head_yaw as u8,
                     ),
                 );
             }
