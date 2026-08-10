@@ -93,6 +93,7 @@ struct EndpointState {
 }
 
 impl NetherNetListener {
+    #[expect(clippy::too_many_arguments)]
     pub async fn bind(
         address: SocketAddr,
         ice_socket: IceSocket,

@@ -96,6 +96,7 @@ pub struct JavaClient {
         tokio::sync::Mutex<Option<Arc<crate::net::bedrock::skin_pack::BedrockSkinPack>>>,
     /// Actual proxy actors presented to this client, separate from pack eligibility.
     pub(crate) bedrock_mannequins: std::sync::Mutex<std::collections::HashSet<i32>>,
+    pub(crate) bedrock_skin_refresh_pending: AtomicBool,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
@@ -256,6 +257,7 @@ impl JavaClient {
             bedrock_skin_pack: ArcSwapOption::from(pending.bedrock_skin_pack),
             pending_bedrock_skin_pack: tokio::sync::Mutex::new(None),
             bedrock_mannequins: std::sync::Mutex::new(std::collections::HashSet::new()),
+            bedrock_skin_refresh_pending: AtomicBool::new(false),
             wait_for_keep_alive: AtomicBool::new(false),
             keep_alive_id: AtomicCell::new(0),
             last_keep_alive_time: AtomicCell::new(Instant::now()),
@@ -284,6 +286,28 @@ impl JavaClient {
             return;
         }
 
+        self.offer_bedrock_skin_pack(
+            &server.bedrock_skin_packs,
+            pack,
+            server
+                .advanced_config
+                .networking
+                .bedrock
+                .nethernet
+                .address
+                .port(),
+            config.resource_pack_url.as_deref(),
+        )
+        .await;
+    }
+
+    async fn offer_bedrock_skin_pack(
+        &self,
+        packs: &crate::net::bedrock::skin_pack::BedrockSkinPacks,
+        pack: Arc<crate::net::bedrock::skin_pack::BedrockSkinPack>,
+        port: u16,
+        public_url: Option<&str>,
+    ) {
         // Admission and completion share this lock: concurrent skin changes cannot
         // overwrite an outstanding offer or leave an untracked pack on the client.
         let mut pending = self.pending_bedrock_skin_pack.lock().await;
@@ -291,7 +315,7 @@ impl JavaClient {
             return;
         }
         // A previous broadcast may have waited behind a newer one.
-        let pack = server.bedrock_skin_packs.current().await.unwrap_or(pack);
+        let pack = packs.current().await.unwrap_or(pack);
         if self
             .bedrock_skin_pack
             .load_full()
@@ -299,17 +323,10 @@ impl JavaClient {
         {
             return;
         }
-        let port = server
-            .advanced_config
-            .networking
-            .bedrock
-            .nethernet
-            .address
-            .port();
         let url = crate::net::bedrock::skin_pack::resource_url(
             &self.server_address,
             port,
-            config.resource_pack_url.as_deref(),
+            public_url,
             pack.id,
         );
         let packet = CAddResourcePack::new(&pack.id, &url, &pack.hash, false, None);

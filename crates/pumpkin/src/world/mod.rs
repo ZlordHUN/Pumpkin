@@ -1123,6 +1123,33 @@ impl World {
             .messages_sent += 1;
     }
 
+    /// Broadcasts a real-time entity update only to clients whose world is ready.
+    pub fn broadcast_realtime_packet_except_editioned<J: ClientPacket, B: BClientPacket>(
+        &self,
+        except: &[uuid::Uuid],
+        je_packet: &J,
+        be_packet: &B,
+    ) {
+        let players = self.players.load();
+        let mut java_recipients = Vec::new();
+        let mut bedrock_recipients = Vec::new();
+
+        for player in players.iter() {
+            if except.contains(&player.gameprofile.id) || !player.can_receive_realtime_updates() {
+                continue;
+            }
+            match player.client.as_ref() {
+                ClientPlatform::Java(_) => java_recipients.push(player),
+                ClientPlatform::Bedrock(client) => bedrock_recipients.push(client),
+            }
+        }
+
+        let recipients_by_version =
+            Self::collect_java_recipients_by_version(java_recipients.into_iter());
+        Self::broadcast_java_grouped(je_packet, recipients_by_version);
+        Self::broadcast_bedrock_grouped(be_packet, bedrock_recipients.into_iter());
+    }
+
     pub fn broadcast_packet_except_editioned<J: ClientPacket, B: BClientPacket>(
         &self,
         except: &[uuid::Uuid],
@@ -1216,6 +1243,21 @@ impl World {
                 .iter()
                 .filter(|candidate| !except.contains(&candidate.gameprofile.id)),
         );
+        Self::broadcast_java_grouped(packet, recipients_by_version);
+    }
+
+    /// Broadcasts a real-time Java entity update only to clients whose world is ready.
+    pub fn broadcast_realtime_packet_except<P: ClientPacket>(
+        &self,
+        except: &[uuid::Uuid],
+        packet: &P,
+    ) {
+        let players = self.players.load();
+        let recipients_by_version =
+            Self::collect_java_recipients_by_version(players.iter().filter(|candidate| {
+                !except.contains(&candidate.gameprofile.id)
+                    && candidate.can_receive_realtime_updates()
+            }));
         Self::broadcast_java_grouped(packet, recipients_by_version);
     }
 
@@ -2582,13 +2624,36 @@ impl World {
         head_yaw: f32,
         velocity: Vector3<f64>,
     ) {
-        let version = client.version.load();
         // Coordinate the queued actor type with concurrent metadata updates. The
         // resource-pack state can change before its asynchronous actor refresh runs.
         let mut presentation = client
             .bedrock_mannequins
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::send_java_player_spawn_locked(
+            client,
+            subject,
+            position,
+            pitch,
+            yaw,
+            head_yaw,
+            velocity,
+            &mut presentation,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn send_java_player_spawn_locked(
+        client: &JavaClient,
+        subject: &Player,
+        position: Vector3<f64>,
+        pitch: f32,
+        yaw: f32,
+        head_yaw: f32,
+        velocity: Vector3<f64>,
+        presentation: &mut std::collections::HashSet<i32>,
+    ) {
+        let version = client.version.load();
         let pack = client.bedrock_skin_pack.load_full();
         let skin = pack
             .as_ref()
@@ -2619,6 +2684,14 @@ impl World {
             client.try_enqueue_packet(data);
         }
         if version < JavaMinecraftVersion::V_1_21 {
+            if let Some(metadata) = subject.java_spawn_metadata(version)
+                && (version >= JavaMinecraftVersion::V_1_9 || metadata.last().copied() == Some(127))
+            {
+                let packet = CSetEntityMetadata::new(subject.entity_id().into(), metadata);
+                if let Ok(data) = client.serialize_packet(&packet) {
+                    client.try_enqueue_packet(data);
+                }
+            }
             return;
         }
         let mut metadata = subject
@@ -2684,6 +2757,16 @@ impl World {
         let Some(client) = recipient.client.java() else {
             return;
         };
+        client
+            .bedrock_skin_refresh_pending
+            .store(true, Ordering::Release);
+        if !recipient.can_receive_realtime_updates()
+            || !client
+                .bedrock_skin_refresh_pending
+                .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
         // Refresh only actors the client already tracks. A pack update must not
         // make distant players or hidden spectators appear in the client's world.
         let subjects = self
@@ -2704,27 +2787,42 @@ impl World {
             client
                 .enqueue_client_packet(&CRemoveEntities::new(&[subject.entity_id().into()]))
                 .await;
-            // Queue pressure may yield long enough for either player to change worlds
-            // or for the tracker to remove the subject from this client's view.
-            if !std::ptr::eq(self, recipient.world().as_ref())
-                || !std::ptr::eq(self, subject.world().as_ref())
-                || !self
-                    .entity_tracker
-                    .get_tracked_entity(subject.entity_id())
-                    .is_some_and(|tracked| tracked.seen_by.contains(&recipient.gameprofile.id))
             {
-                continue;
-            }
-            let entity = subject.get_entity();
-            Self::send_java_player_spawn(
-                client,
-                &subject,
-                entity.pos.load(),
-                entity.pitch.load(),
-                entity.yaw.load(),
-                entity.head_yaw.load(),
-                entity.velocity.load(),
-            );
+                // Revalidate while holding the same lock as tracker removals, so an
+                // unpair cannot enqueue its removal before this replacement spawn.
+                let mut presentation = client
+                    .bedrock_mannequins
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !recipient.can_receive_realtime_updates() {
+                    client
+                        .bedrock_skin_refresh_pending
+                        .store(true, Ordering::Release);
+                    if !recipient.can_receive_realtime_updates() {
+                        continue;
+                    }
+                }
+                if !std::ptr::eq(self, recipient.world().as_ref())
+                    || !std::ptr::eq(self, subject.world().as_ref())
+                    || !self
+                        .entity_tracker
+                        .get_tracked_entity(subject.entity_id())
+                        .is_some_and(|tracked| tracked.seen_by.contains(&recipient.gameprofile.id))
+                {
+                    continue;
+                }
+                let entity = subject.get_entity();
+                Self::send_java_player_spawn_locked(
+                    client,
+                    &subject,
+                    entity.pos.load(),
+                    entity.pitch.load(),
+                    entity.yaw.load(),
+                    entity.head_yaw.load(),
+                    entity.velocity.load(),
+                    &mut presentation,
+                );
+            };
             let mut equipment = vec![(
                 EquipmentSlot::MAIN_HAND.discriminant(),
                 subject.inventory.held_item(),
@@ -3406,7 +3504,7 @@ impl World {
                     client, &player, position, pitch, yaw, yaw, velocity,
                 ),
                 ClientPlatform::Bedrock(client) => {
-                    client.try_enqueue_client_packet(&bedrock_add_player)
+                    client.try_enqueue_client_packet(&bedrock_add_player);
                 }
             }
         }
@@ -5295,7 +5393,7 @@ impl World {
                         }
                     }
                     ClientPlatform::Bedrock(client) => {
-                        client.try_enqueue_client_packet(&bedrock_remove)
+                        client.try_enqueue_client_packet(&bedrock_remove);
                     }
                 }
             }

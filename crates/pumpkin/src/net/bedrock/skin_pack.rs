@@ -17,11 +17,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-const CACHE_VERSION: u8 = 4;
+const CACHE_VERSION: u8 = 5;
 const MAX_SKIN_DIMENSION: u32 = 128;
 const MANIFEST_FILE: &str = "manifest.json";
 const PACK_FILE: &str = "bedrock_skins.zip";
-const PACK_META: &[u8] = br#"{"pack":{"pack_format":88,"min_format":[88,0],"max_format":[88,0],"description":"Pumpkin Bedrock player skins"}}"#;
+const PACK_META: &[u8] = br#"{"pack":{"pack_format":88,"min_format":[84,0],"max_format":[88,0],"description":"Pumpkin Bedrock player skins"}}"#;
 
 #[derive(Clone)]
 pub struct BedrockSkin {
@@ -177,19 +177,24 @@ impl BedrockSkinPacks {
         };
         let mut dirty = false;
         if let Some(cache_dir) = &self.cache_dir {
-            let result = previous
-                .as_ref()
-                .filter(|previous| {
-                    !registry.dirty && previous.hash == registry.skins[&player_id].hash
-                })
-                .map_or_else(
-                    || {
-                        fs::create_dir_all(cache_dir).and_then(|()| {
-                            persist_skin(cache_dir, player_id, &registry.skins[&player_id])
+            let result = fs::create_dir_all(cache_dir)
+                .and_then(|()| {
+                    if registry.dirty {
+                        // An earlier registration may have failed before its
+                        // images were written. Repair every asset referenced by
+                        // the next manifest, not just this player's skin.
+                        registry.skins.iter().try_for_each(|(&player_id, skin)| {
+                            persist_skin(cache_dir, player_id, skin)
                         })
-                    },
-                    |_| Ok(()),
-                )
+                    } else if previous
+                        .as_ref()
+                        .is_none_or(|previous| previous.hash != registry.skins[&player_id].hash)
+                    {
+                        persist_skin(cache_dir, player_id, &registry.skins[&player_id])
+                    } else {
+                        Ok(())
+                    }
+                })
                 .and_then(|()| persist(cache_dir, &registry.skins, &pack));
             if let Err(error) = result {
                 dirty = true;
@@ -206,14 +211,35 @@ impl BedrockSkinPacks {
         skin
     }
 
-    /// Applies the configured trust policy and rate limit before a skin can be
-    /// sent to other clients or added to the Java resource pack.
+    /// Applies the trust policy and rate limit to an explicit live skin update.
     pub fn accept(
         &self,
         player_id: Uuid,
         skin: Skin,
         trusted_only: bool,
         change_cooldown: Duration,
+    ) -> (Skin, bool) {
+        self.accept_skin(player_id, skin, trusted_only, change_cooldown, false)
+    }
+
+    /// Accepts a login skin, preserving a known cape when login omits it.
+    pub fn accept_initial(
+        &self,
+        player_id: Uuid,
+        skin: Skin,
+        trusted_only: bool,
+        change_cooldown: Duration,
+    ) -> (Skin, bool) {
+        self.accept_skin(player_id, skin, trusted_only, change_cooldown, true)
+    }
+
+    fn accept_skin(
+        &self,
+        player_id: Uuid,
+        skin: Skin,
+        trusted_only: bool,
+        change_cooldown: Duration,
+        is_login: bool,
     ) -> (Skin, bool) {
         let rejected_skin = (trusted_only && !skin.is_trusted) || !valid_skin(&skin);
         let skin = if rejected_skin {
@@ -240,7 +266,7 @@ impl BedrockSkinPacks {
             // carries its cape. This is not a second skin change and must not be
             // rejected by the user-facing skin-change cooldown. Conversely,
             // preserve a known cape when a later login omits it.
-            if same_body && previous_has_cape && !has_cape {
+            if is_login && same_body && previous_has_cape && !has_cape {
                 return (previous.skin.clone(), false);
             }
             if !(rejected_skin || same_body && !previous_has_cape && has_cape)
@@ -384,7 +410,9 @@ fn load_registry(cache_dir: &Path) -> io::Result<SkinPackRegistry> {
     }
     let manifest: CacheManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if manifest.version != CACHE_VERSION {
+    // Version 4 has the same cached images and manifest fields. Only the ZIP
+    // needs rebuilding for model-aware revisions and Java 26.1 compatibility.
+    if manifest.version != CACHE_VERSION && manifest.version != 4 {
         return Ok(SkinPackRegistry::default());
     }
 
@@ -413,13 +441,23 @@ fn load_registry(cache_dir: &Path) -> io::Result<SkinPackRegistry> {
     }
 
     let pack_data = fs::read(cache_dir.join(PACK_FILE));
+    let mut dirty = false;
     let pack = match pack_data {
-        Ok(data) if hex::encode(Sha1::digest(&data)) == manifest.pack_hash => {
+        Ok(data)
+            if manifest.version == CACHE_VERSION
+                && hex::encode(Sha1::digest(&data)) == manifest.pack_hash =>
+        {
             pack_from_data(&skins, data)?
         }
         _ => {
             let pack = build_pack(&skins)?;
-            persist(cache_dir, &skins, &pack)?;
+            if let Err(error) = persist(cache_dir, &skins, &pack) {
+                dirty = true;
+                warn!(
+                    path = %cache_dir.display(),
+                    "Failed to persist the rebuilt Bedrock skin pack: {error}"
+                );
+            }
             pack
         }
     };
@@ -429,7 +467,7 @@ fn load_registry(cache_dir: &Path) -> io::Result<SkinPackRegistry> {
         skins,
         current: Some(pack),
         revisions,
-        dirty: false,
+        dirty,
     })
 }
 
@@ -477,6 +515,13 @@ const fn has_cape(skin: &Skin) -> bool {
 fn build_pack(skins: &HashMap<Uuid, CachedSkin>) -> io::Result<Arc<BedrockSkinPack>> {
     let mut ordered = skins.iter().collect::<Vec<_>>();
     ordered.sort_unstable_by_key(|(player_id, _)| player_id.as_u128());
+    // Model-only changes must create a new resource-pack revision too: Java
+    // clients retain the mannequin model associated with their loaded pack.
+    let models = skins
+        .iter()
+        .map(|(&player_id, skin)| (player_id, skin.slim))
+        .collect::<BTreeMap<_, _>>();
+    let models = serde_json::to_vec(&models).map_err(io::Error::other)?;
     let mut files = Vec::with_capacity(ordered.len() * 2);
     for (player_id, skin) in ordered {
         files.push((
@@ -496,8 +541,9 @@ fn build_pack(skins: &HashMap<Uuid, CachedSkin>) -> io::Result<Arc<BedrockSkinPa
             ));
         }
     }
-    let mut entries = Vec::with_capacity(files.len() + 1);
+    let mut entries = Vec::with_capacity(files.len() + 2);
     entries.push(("pack.mcmeta", PACK_META));
+    entries.push(("pumpkin_skin_models.json", models.as_slice()));
     entries.extend(files.iter().map(|(path, data)| (path.as_str(), *data)));
     pack_from_data(skins, stored_zip(&entries)?)
 }
@@ -722,6 +768,15 @@ mod tests {
         );
         let first = packs.current().await.unwrap();
         assert!(first.skin(player_id).is_some());
+        assert!(
+            first
+                .data
+                .windows(PACK_META.len())
+                .any(|bytes| bytes == PACK_META)
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(PACK_META).unwrap();
+        assert_eq!(metadata["pack"]["min_format"], serde_json::json!([84, 0]));
+        assert_eq!(metadata["pack"]["max_format"], serde_json::json!([88, 0]));
         packs.register(player_id, &skin).await.unwrap();
         assert!(Arc::ptr_eq(&first, &packs.current().await.unwrap()));
 
@@ -739,6 +794,162 @@ mod tests {
         assert_eq!(reloaded.id, second.id);
         assert_eq!(reloaded.hash, second.hash);
         assert!(reloaded.skin(player_id).is_some());
+        assert!(reloaded.skin(second_player).is_some());
+    }
+
+    #[tokio::test]
+    async fn retains_and_repairs_version_four_skins_when_migration_cannot_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let packs = BedrockSkinPacks::load(directory.path().to_owned());
+        let player_id = Uuid::new_v4();
+        let mut skin = Skin::steve();
+        skin.cape_width = 64;
+        skin.cape_height = 32;
+        skin.cape_data = vec![0x7f; 64 * 32 * 4];
+        packs.register(player_id, &skin).await.unwrap();
+        let expected = packs.current().await.unwrap();
+
+        let body = fs::read(skin_path(directory.path(), player_id)).unwrap();
+        let cape = fs::read(cape_path(directory.path(), player_id)).unwrap();
+        let old_metadata = br#"{"pack":{"pack_format":88,"min_format":[88,0],"max_format":[88,0],"description":"Pumpkin Bedrock player skins"}}"#;
+        let body_path = format!(
+            "assets/pumpkin/textures/bedrock_skins/{}.png",
+            player_id.simple()
+        );
+        let cape_path_in_pack = format!(
+            "assets/pumpkin/textures/bedrock_skins/{}_cape.png",
+            player_id.simple()
+        );
+        let old_zip = stored_zip(&[
+            ("pack.mcmeta", old_metadata),
+            (&body_path, &body),
+            (&cape_path_in_pack, &cape),
+        ])
+        .unwrap();
+        let manifest_path = directory.path().join(MANIFEST_FILE);
+        let mut manifest: CacheManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest.version = 4;
+        manifest.pack_hash = hex::encode(Sha1::digest(&old_zip));
+        fs::write(directory.path().join(PACK_FILE), &old_zip).unwrap();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        drop(packs);
+
+        let blocked_path = directory.path().join(PACK_FILE).with_extension("tmp");
+        fs::create_dir(&blocked_path).unwrap();
+        let packs = BedrockSkinPacks::load(directory.path().to_owned());
+        assert!(packs.registry.read().await.dirty);
+        let migrated = packs.current().await.unwrap();
+        assert_eq!(migrated.id, expected.id);
+        assert_eq!(migrated.hash, expected.hash);
+        assert_ne!(migrated.hash, manifest.pack_hash);
+        assert!(migrated.skin(player_id).unwrap().cape_asset.is_some());
+        assert_eq!(
+            fs::read(skin_path(directory.path(), player_id)).unwrap(),
+            body
+        );
+        assert_eq!(
+            fs::read(cape_path(directory.path(), player_id)).unwrap(),
+            cape
+        );
+        let unchanged_manifest: CacheManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(unchanged_manifest.version, 4);
+        assert_eq!(unchanged_manifest.pack_hash, manifest.pack_hash);
+
+        fs::remove_dir(blocked_path).unwrap();
+        packs.register(player_id, &skin).await.unwrap();
+        assert!(!packs.registry.read().await.dirty);
+        drop(packs);
+        let reloaded = BedrockSkinPacks::load(directory.path().to_owned());
+        let reloaded = reloaded.current().await.unwrap();
+        assert_eq!(reloaded.id, migrated.id);
+        assert_eq!(reloaded.hash, migrated.hash);
+        assert!(reloaded.skin(player_id).unwrap().cape_asset.is_some());
+        let manifest: CacheManifest =
+            serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.version, CACHE_VERSION);
+        assert_eq!(manifest.pack_hash, migrated.hash);
+    }
+
+    #[tokio::test]
+    async fn model_only_update_changes_the_persisted_pack_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let packs = BedrockSkinPacks::load(directory.path().to_owned());
+        let player_id = Uuid::new_v4();
+        let (mut skin, changed) =
+            packs.accept_initial(player_id, Skin::steve(), true, Duration::ZERO);
+        assert!(changed);
+        assert!(!packs.register(player_id, &skin).await.unwrap().slim);
+        let wide = packs.current().await.unwrap();
+        let wide_png = fs::read(skin_path(directory.path(), player_id)).unwrap();
+
+        skin.resource_patch =
+            br#"{"geometry":{"default":"geometry.humanoid.customSlim"}}"#.to_vec();
+        let (skin, changed) = packs.accept(player_id, skin, true, Duration::ZERO);
+        assert!(changed);
+        assert!(packs.register(player_id, &skin).await.unwrap().slim);
+        let slim = packs.current().await.unwrap();
+
+        assert_eq!(
+            fs::read(skin_path(directory.path(), player_id)).unwrap(),
+            wide_png
+        );
+        assert_ne!(wide.id, slim.id);
+        assert_ne!(wide.hash, slim.hash);
+        assert_ne!(wide.data, slim.data);
+        assert!(
+            !packs
+                .get(wide.id)
+                .await
+                .unwrap()
+                .skin(player_id)
+                .unwrap()
+                .slim
+        );
+        packs.register(player_id, &skin).await.unwrap();
+        assert!(Arc::ptr_eq(&slim, &packs.current().await.unwrap()));
+
+        drop(packs);
+        let reloaded = BedrockSkinPacks::load(directory.path().to_owned());
+        let reloaded = reloaded.current().await.unwrap();
+        assert_eq!(reloaded.id, slim.id);
+        assert_eq!(reloaded.hash, slim.hash);
+        assert!(reloaded.skin(player_id).unwrap().slim);
+    }
+
+    #[tokio::test]
+    async fn another_registration_repairs_all_assets_after_a_persistence_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let packs = BedrockSkinPacks::load(directory.path().to_owned());
+        let first_player = Uuid::new_v4();
+        let mut skin = Skin::steve();
+        skin.cape_width = 64;
+        skin.cape_height = 32;
+        skin.cape_data = vec![0x7f; 64 * 32 * 4];
+
+        // A directory at the image destination deterministically fails the
+        // atomic rename, including when the tests run with elevated privileges.
+        let blocked_path = skin_path(directory.path(), first_player);
+        fs::create_dir(&blocked_path).unwrap();
+        packs.register(first_player, &skin).await.unwrap();
+        assert!(packs.registry.read().await.dirty);
+        assert!(!directory.path().join(MANIFEST_FILE).exists());
+        fs::remove_dir(blocked_path).unwrap();
+
+        let second_player = Uuid::new_v4();
+        packs.register(second_player, &Skin::steve()).await.unwrap();
+        assert!(!packs.registry.read().await.dirty);
+        assert!(skin_path(directory.path(), first_player).is_file());
+        assert!(cape_path(directory.path(), first_player).is_file());
+        let expected = packs.current().await.unwrap();
+
+        drop(packs);
+        let reloaded = BedrockSkinPacks::load(directory.path().to_owned());
+        let reloaded = reloaded.current().await.unwrap();
+        assert_eq!(reloaded.id, expected.id);
+        assert_eq!(reloaded.hash, expected.hash);
+        assert!(reloaded.skin(first_player).unwrap().cape_asset.is_some());
         assert!(reloaded.skin(second_player).is_some());
     }
 
@@ -861,11 +1072,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completes_and_preserves_a_delayed_cape() {
-        let packs = BedrockSkinPacks::default();
+    async fn completes_preserves_and_removes_a_cape_through_the_persisted_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let packs = BedrockSkinPacks::load(directory.path().to_owned());
         let player_id = Uuid::new_v4();
         let skin = Skin::steve();
-        let (_, changed) = packs.accept(player_id, skin.clone(), true, Duration::from_mins(1));
+        let (_, changed) =
+            packs.accept_initial(player_id, skin.clone(), true, Duration::from_mins(1));
         assert!(changed);
 
         let mut with_cape = skin.clone();
@@ -886,9 +1099,40 @@ mod tests {
                 .is_some()
         );
 
-        let (preserved, changed) = packs.accept(player_id, skin, true, Duration::ZERO);
+        let with_cape = packs.current().await.unwrap();
+        let (preserved, changed) =
+            packs.accept_initial(player_id, skin.clone(), true, Duration::ZERO);
         assert!(!changed);
         assert!(has_cape(&preserved));
+        packs.register(player_id, &preserved).await.unwrap();
+        assert!(Arc::ptr_eq(&with_cape, &packs.current().await.unwrap()));
+
+        let (limited, changed) =
+            packs.accept(player_id, skin.clone(), true, Duration::from_mins(1));
+        assert!(!changed);
+        assert!(has_cape(&limited));
+
+        let (without_cape, changed) = packs.accept(player_id, skin, true, Duration::ZERO);
+        assert!(changed);
+        assert!(!has_cape(&without_cape));
+        assert!(
+            packs
+                .register(player_id, &without_cape)
+                .await
+                .unwrap()
+                .cape_asset
+                .is_none()
+        );
+        let without_cape = packs.current().await.unwrap();
+        assert_ne!(with_cape.id, without_cape.id);
+        assert!(!cape_path(directory.path(), player_id).exists());
+
+        drop(packs);
+        let reloaded = BedrockSkinPacks::load(directory.path().to_owned());
+        let reloaded = reloaded.current().await.unwrap();
+        assert_eq!(reloaded.id, without_cape.id);
+        assert_eq!(reloaded.hash, without_cape.hash);
+        assert!(reloaded.skin(player_id).unwrap().cape_asset.is_none());
     }
 
     #[test]

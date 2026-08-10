@@ -619,7 +619,9 @@ fn skin_color(value: &str) -> i32 {
 
 /// Mannequins share the humanoid fields, but their own fields reuse the player-only indices.
 /// Gravity remains disabled on the client proxy regardless of the real player's state.
-pub(crate) fn mannequin_shared_metadata(data: pumpkin_data::tracked_data::TrackedData) -> bool {
+pub(crate) const fn mannequin_shared_metadata(
+    data: pumpkin_data::tracked_data::TrackedData,
+) -> bool {
     data.id.v26_2 < pumpkin_data::tracked_data::mannequin::PROFILE.id.v26_2
         && data.id.v26_2 != pumpkin_data::tracked_data::entity::NO_GRAVITY.id.v26_2
 }
@@ -903,7 +905,7 @@ impl Player {
         let skin_config = &server.advanced_config.networking.bedrock.skins;
         bedrock_skin = server
             .bedrock_skin_packs
-            .accept(
+            .accept_initial(
                 player_uuid,
                 bedrock_skin,
                 skin_config.trusted_only,
@@ -3060,6 +3062,20 @@ impl Player {
             || self.client_loaded_timeout.load(Ordering::Relaxed) == 0
     }
 
+    /// Whether the client is ready to receive updates that reference entities in its world.
+    ///
+    /// Modern Java clients explicitly report this after creating their client level. Older
+    /// protocol versions lack that packet and retain their existing readiness behavior.
+    #[must_use]
+    pub fn can_receive_realtime_updates(&self) -> bool {
+        match self.client.as_ref() {
+            ClientPlatform::Java(_) if self.supports_player_loaded() => {
+                self.client_loaded.load(Ordering::Relaxed)
+            }
+            _ => self.has_client_loaded(),
+        }
+    }
+
     pub fn set_client_loaded(&self, loaded: bool) {
         if !self.supports_player_loaded() {
             self.client_loaded.store(true, Ordering::Relaxed);
@@ -3070,6 +3086,20 @@ impl Player {
             self.client_loaded_timeout.store(60, Ordering::Relaxed);
         }
         self.client_loaded.store(loaded, Ordering::Relaxed);
+        if loaded
+            && let Some(client) = self.client.java()
+            && client
+                .bedrock_skin_refresh_pending
+                .swap(false, Ordering::AcqRel)
+            && let Some(player) = self.world().get_player_by_uuid(self.gameprofile.id)
+        {
+            self.spawn_task(async move {
+                player
+                    .world()
+                    .refresh_bedrock_players_for_java(&player)
+                    .await;
+            });
+        }
     }
 
     pub fn get_attack_cooldown_progress(&self, tps: f64, base_time: f64, attack_speed: f64) -> f64 {

@@ -100,7 +100,7 @@ impl BedrockClient {
             );
 
             if pos_changed && delta.length_squared() >= 64.0 {
-                world.broadcast_packet_except_editioned(
+                world.broadcast_realtime_packet_except_editioned(
                     &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CEntityPositionSync::new(
                         player.entity_id().into(),
@@ -113,7 +113,7 @@ impl BedrockClient {
                     &bedrock_move_packet,
                 );
             } else if pos_changed && rot_changed {
-                world.broadcast_packet_except_editioned(
+                world.broadcast_realtime_packet_except_editioned(
                     &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityPosRot::new(
                         player.entity_id().into(),
@@ -129,7 +129,7 @@ impl BedrockClient {
                     &bedrock_move_packet,
                 );
             } else if pos_changed {
-                world.broadcast_packet_except_editioned(
+                world.broadcast_realtime_packet_except_editioned(
                     &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityPos::new(
                         player.entity_id().into(),
@@ -143,7 +143,7 @@ impl BedrockClient {
                     &bedrock_move_packet,
                 );
             } else if rot_changed {
-                world.broadcast_packet_except_editioned(
+                world.broadcast_realtime_packet_except_editioned(
                     &relative_exclusions,
                     &pumpkin_protocol::java::client::play::CUpdateEntityRot::new(
                         player.entity_id().into(),
@@ -167,14 +167,16 @@ impl BedrockClient {
                     on_ground,
                 );
                 for viewer in mannequin_viewers {
-                    if tracked.seen_by.contains(&viewer.gameprofile.id) {
+                    if viewer.can_receive_realtime_updates()
+                        && tracked.seen_by.contains(&viewer.gameprofile.id)
+                    {
                         viewer.try_send_client_packet(&movement);
                     }
                 }
             }
 
             if head_rot_changed {
-                world.broadcast_packet_except(
+                world.broadcast_realtime_packet_except(
                     &[player.gameprofile.id],
                     &pumpkin_protocol::java::client::play::CHeadRot::new(
                         player.entity_id().into(),
