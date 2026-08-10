@@ -1,3 +1,4 @@
+mod java_emote;
 pub mod nethernet;
 pub mod play;
 pub mod skin_pack;

@@ -511,6 +511,10 @@ pub struct Player {
     pub ping: AtomicU32,
     /// The amount of ticks since the player's last attack.
     pub last_attacked_ticks: AtomicU32,
+    /// Cancels the previous Java emote projection when a new Bedrock emote starts.
+    pub(crate) java_emote_sequence: AtomicU32,
+    /// The last tick on which a Bedrock emote was projected to Java clients.
+    pub(crate) last_java_emote_tick: AtomicI32,
     /// The player's last known experience level.
     pub last_sent_xp: AtomicI32,
     pub last_sent_health: AtomicI32,
@@ -947,6 +951,8 @@ impl Player {
             last_action_time: AtomicCell::new(std::time::Instant::now()),
             ping: AtomicU32::new(0),
             last_attacked_ticks: AtomicU32::new(0),
+            java_emote_sequence: AtomicU32::new(0),
+            last_java_emote_tick: AtomicI32::new(-4),
             client_loaded: AtomicBool::new(false),
             bedrock_spawned: AtomicBool::new(false),
             client_loaded_timeout: AtomicU32::new(60),

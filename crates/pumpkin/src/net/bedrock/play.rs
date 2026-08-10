@@ -495,29 +495,20 @@ impl BedrockClient {
             return;
         }
 
-        tracing::info!(
-            "handle_emote: player={} packet={:?}",
-            player.gameprofile.name,
-            packet
-        );
-
         let entity = &player.living_entity.entity;
         let world = entity.world.load();
+        super::java_emote::broadcast(player, packet.emote_id.as_ref());
 
         let mut broadcast_packet = packet;
         broadcast_packet.runtime_entity_id = VarULong(entity.entity_id as u64);
         broadcast_packet.flags |= pumpkin_protocol::bedrock::server::emote::EMOTE_FLAG_SERVER_SIDE;
-
-        world
-            .broadcast_packet_except_editioned(
-                &[player.gameprofile.id],
-                &CEntityAnimation::new(
-                    VarInt(entity.entity_id),
-                    Animation::SwingMainArm, // Fallback for Java? Or just ignore
-                ),
-                &broadcast_packet,
-            )
-            .await;
+        for recipient in world.players.load().iter() {
+            if recipient.gameprofile.id != player.gameprofile.id
+                && let ClientPlatform::Bedrock(client) = recipient.client.as_ref()
+            {
+                client.enqueue_packet(&broadcast_packet).await;
+            }
+        }
     }
 
     pub fn handle_emote_list(&self, player: &Arc<Player>, _server: &Server, packet: &SEmoteList) {

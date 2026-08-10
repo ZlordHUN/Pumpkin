@@ -40,7 +40,7 @@ impl ClientPacket for CEntityAnimation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Animation {
     SwingMainArm,
     LeaveBed = 2,
