@@ -1,6 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use pumpkin_data::entity::EntityPose;
+use pumpkin_protocol::bedrock::client::set_actor_data::entity_data_flag;
 
 impl BedrockClient {
     #[expect(clippy::too_many_lines)]
@@ -164,9 +165,17 @@ impl BedrockClient {
         }
 
         if input_data.get(InputData::StartCrawling as usize) {
+            // Pumpkin uses Java's Swimming pose for crawling because it supplies the
+            // shared 0.6-block collision box. Bedrock's separate CRAWLING flag only
+            // controls its client animation, so both representations must be updated.
             entity.set_pose(EntityPose::Swimming);
+            entity.set_bedrock_status_flag(entity_data_flag::CRAWLING, true);
         } else if input_data.get(InputData::StopCrawling as usize) {
             player.update_player_pose().await;
+            entity.set_bedrock_status_flag(
+                entity_data_flag::CRAWLING,
+                entity.pose.load() == EntityPose::Swimming,
+            );
         }
 
         if input_data.get(InputData::StartFlying as usize) {

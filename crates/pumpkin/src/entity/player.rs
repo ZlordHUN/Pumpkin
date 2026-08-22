@@ -2129,8 +2129,12 @@ impl Player {
             desired_pose
         } else if self.can_fit_pose(EntityPose::Crouching) {
             EntityPose::Crouching
-        } else {
+        } else if matches!(self.client.as_ref(), ClientPlatform::Java(_)) {
+            // Java automatically crawls when neither standing nor crouching fits.
+            // Bedrock enters this pose only after sending StartCrawling.
             EntityPose::Swimming
+        } else {
+            entity.pose.load()
         };
 
         if entity.pose.load() != new_pose {

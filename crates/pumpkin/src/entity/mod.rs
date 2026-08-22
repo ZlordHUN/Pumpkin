@@ -2923,50 +2923,54 @@ impl Entity {
         );
 
         if let Some(bedrock_flag) = flag.to_bedrock() {
-            let (key, index) = if bedrock_flag >= 64 {
-                (entity_data_key::FLAGS_TWO, (bedrock_flag - 64) as u8)
-            } else {
-                (entity_data_key::FLAGS, bedrock_flag as u8)
-            };
-
-            if value {
-                let mask = 1i64 << index;
-                if key == entity_data_key::FLAGS {
-                    self.bedrock_flags.fetch_or(mask, Ordering::Relaxed);
-                } else {
-                    self.bedrock_flags_two.fetch_or(mask, Ordering::Relaxed);
-                }
-            } else {
-                let mask = !(1i64 << index);
-                if key == entity_data_key::FLAGS {
-                    self.bedrock_flags.fetch_and(mask, Ordering::Relaxed);
-                } else {
-                    self.bedrock_flags_two.fetch_and(mask, Ordering::Relaxed);
-                }
-            }
-
-            let world = self.world.load();
-            let chunk_pos = self.chunk_pos.load();
-            let mut metadata = EntityMetadata(std::collections::HashMap::new());
-            metadata.set(
-                entity_data_key::FLAGS,
-                MetadataValue::Long(self.bedrock_flags.load(Ordering::Relaxed)),
-            );
-            metadata.set(
-                entity_data_key::FLAGS_TWO,
-                MetadataValue::Long(self.bedrock_flags_two.load(Ordering::Relaxed)),
-            );
-            let packet = CSetActorData {
-                actor_runtime_id: VarULong(self.entity_id as u64),
-                metadata,
-                synced_properties: PropertySyncData {
-                    int_properties: std::collections::HashMap::new(),
-                    float_properties: std::collections::HashMap::new(),
-                },
-                tick: VarULong(0),
-            };
-            world.broadcast_to_chunk_bedrock(chunk_pos, &packet);
+            self.set_bedrock_status_flag(bedrock_flag, value);
         }
+    }
+
+    pub fn set_bedrock_status_flag(&self, flag: u32, value: bool) {
+        let (key, index) = if flag >= 64 {
+            (entity_data_key::FLAGS_TWO, (flag - 64) as u8)
+        } else {
+            (entity_data_key::FLAGS, flag as u8)
+        };
+
+        if value {
+            let mask = 1i64 << index;
+            if key == entity_data_key::FLAGS {
+                self.bedrock_flags.fetch_or(mask, Ordering::Relaxed);
+            } else {
+                self.bedrock_flags_two.fetch_or(mask, Ordering::Relaxed);
+            }
+        } else {
+            let mask = !(1i64 << index);
+            if key == entity_data_key::FLAGS {
+                self.bedrock_flags.fetch_and(mask, Ordering::Relaxed);
+            } else {
+                self.bedrock_flags_two.fetch_and(mask, Ordering::Relaxed);
+            }
+        }
+
+        let world = self.world.load();
+        let chunk_pos = self.chunk_pos.load();
+        let mut metadata = EntityMetadata(std::collections::HashMap::new());
+        metadata.set(
+            entity_data_key::FLAGS,
+            MetadataValue::Long(self.bedrock_flags.load(Ordering::Relaxed)),
+        );
+        metadata.set(
+            entity_data_key::FLAGS_TWO,
+            MetadataValue::Long(self.bedrock_flags_two.load(Ordering::Relaxed)),
+        );
+        let packet = CSetActorData {
+            actor_runtime_id: VarULong(self.entity_id as u64),
+            metadata,
+            synced_properties: PropertySyncData {
+                int_properties: std::collections::HashMap::new(),
+                float_properties: std::collections::HashMap::new(),
+            },
+            tick: VarULong(0),
+        };
+        world.broadcast_to_chunk_bedrock(chunk_pos, &packet);
     }
 
     /// Plays sound at this entity's position with the entity's sound category
