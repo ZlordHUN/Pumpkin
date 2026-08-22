@@ -6478,7 +6478,7 @@ impl EntityBase for Player {
             self.request_teleport(position, yaw, pitch);
             let entity = self.get_entity();
             let chunk_pos = entity.chunk_pos.load();
-            entity.world.load().broadcast_to_chunk_except(
+            entity.world.load().broadcast_to_chunk_except_editioned(
                 chunk_pos,
                 &[self.living_entity.entity.entity_uuid],
                 &CEntityPositionSync::new(
@@ -6488,6 +6488,23 @@ impl EntityBase for Player {
                     yaw,
                     pitch,
                     entity.on_ground.load(Ordering::SeqCst),
+                ),
+                &CBedrockMovePlayer::new(
+                    VarULong(self.entity_id() as u64),
+                    Vector3::new(
+                        position.x as f32,
+                        position.y as f32 + entity.entity_type.eye_height,
+                        position.z as f32,
+                    ),
+                    pitch,
+                    yaw,
+                    yaw,
+                    CBedrockMovePlayer::MODE_TELEPORT,
+                    entity.on_ground.load(Ordering::SeqCst),
+                    VarULong(0),
+                    0,
+                    0,
+                    VarULong(self.tick_counter.load(Ordering::Relaxed).max(0) as u64),
                 ),
             );
         } else if let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) {
