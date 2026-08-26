@@ -33,7 +33,6 @@ pub fn build_java_mapping() -> String {
             "java_packet",
             "ClientboundPacket",
             &format!("pumpkin_protocol::java::client::{}", state),
-            false,
             MappingMode::Serialize,
         );
     }
@@ -54,7 +53,6 @@ pub fn build_java_mapping() -> String {
             "java_packet",
             "ServerboundPacket",
             &format!("pumpkin_protocol::java::server::{}", state),
-            false,
             MappingMode::Deserialize,
         );
     }
@@ -75,7 +73,6 @@ pub fn build_java_mapping() -> String {
             "java_packet",
             "ClientboundPacket",
             &format!("pumpkin_protocol::java::client::{}", state),
-            false,
             MappingMode::ToWit,
         );
     }
@@ -92,7 +89,6 @@ pub fn build_java_mapping() -> String {
             "java_packet",
             "ClientboundPacket",
             &format!("pumpkin_protocol::java::client::{}", state),
-            false,
             MappingMode::Downcast,
         );
     }
@@ -118,7 +114,6 @@ pub fn build_bedrock_mapping() -> String {
         "packet",
         "BClientboundPacket",
         "pumpkin_protocol::bedrock::client",
-        true,
         MappingMode::Serialize,
     );
 
@@ -137,7 +132,6 @@ pub fn build_bedrock_mapping() -> String {
         "packet",
         "BServerboundPacket",
         "pumpkin_protocol::bedrock::server",
-        true,
         MappingMode::Deserialize,
     );
 
@@ -156,7 +150,6 @@ pub fn build_bedrock_mapping() -> String {
         "packet",
         "BClientboundPacket",
         "pumpkin_protocol::bedrock::client",
-        true,
         MappingMode::ToWit,
     );
 
@@ -171,7 +164,6 @@ pub fn build_bedrock_mapping() -> String {
         "packet",
         "BClientboundPacket",
         "pumpkin_protocol::bedrock::client",
-        true,
         MappingMode::Downcast,
     );
     output.push_str("    None\n");
@@ -545,7 +537,6 @@ fn process_packets(
     attr_name: &str,
     variant_prefix: &str,
     rust_path_prefix: &str,
-    skip_raknet: bool,
     mode: MappingMode,
 ) {
     let paths = fs::read_dir(dir).expect("Failed to read packet directory");
@@ -556,9 +547,6 @@ fn process_packets(
 
     for path in sorted_paths {
         if path.is_dir() {
-            if skip_raknet && path.file_name().unwrap() == "raknet" {
-                continue;
-            }
             process_packets(
                 path.to_str().unwrap(),
                 state,
@@ -566,7 +554,6 @@ fn process_packets(
                 attr_name,
                 variant_prefix,
                 rust_path_prefix,
-                skip_raknet,
                 mode,
             );
             continue;

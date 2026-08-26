@@ -7,7 +7,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::trace;
 
-use crate::{STOP_INTERRUPT, net::bedrock::status::IceSocket};
+use crate::STOP_INTERRUPT;
 
 enum Command {
     Register {
@@ -50,7 +50,7 @@ impl Drop for Registration {
 }
 
 impl IceRouter {
-    pub(super) async fn bind(public: IceSocket) -> Result<Self, Error> {
+    pub(super) async fn bind(public: UdpSocket) -> Result<Self, Error> {
         let public_addr = public.local_addr()?;
         let internal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let internal_addr = internal.local_addr()?;
@@ -91,7 +91,7 @@ impl IceRouter {
 }
 
 async fn run(
-    public: IceSocket,
+    public: UdpSocket,
     internal_socket: UdpSocket,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {

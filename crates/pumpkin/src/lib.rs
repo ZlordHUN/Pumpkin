@@ -15,7 +15,6 @@ use crate::logging::{
 use crate::net::bedrock::{
     BedrockClient,
     nethernet::{NetherNetListener, load_or_create_identity_key},
-    status::{IceSocket, StatusResponder},
 };
 use crate::net::java::JavaClient;
 use crate::net::java::pending::PendingConnection;
@@ -238,7 +237,6 @@ fn resolve_some<T: Future, D, F: FnOnce(D) -> T>(
 pub struct PumpkinServer {
     pub server: Arc<Server>,
     pub tcp_listener: Option<TcpListener>,
-    pub bedrock_status: Option<StatusResponder>,
     pub nethernet_listener: Option<NetherNetListener>,
 }
 
@@ -343,29 +341,20 @@ impl PumpkinServer {
             }
         };
 
-        let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
-        let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
+        let nethernet_listener = Self::bind_nethernet(&server).await;
 
         Self {
             server,
             tcp_listener,
-            bedrock_status,
             nethernet_listener,
         }
     }
 
-    async fn bind_nethernet(
-        server: &Arc<Server>,
-        ice_socket: Option<IceSocket>,
-    ) -> Option<NetherNetListener> {
+    async fn bind_nethernet(server: &Arc<Server>) -> Option<NetherNetListener> {
         let config = &server.advanced_config.networking.bedrock;
         if !config.enabled || !config.nethernet.enabled {
             return None;
         }
-        let Some(ice_socket) = ice_socket else {
-            error!("Bedrock UDP should be bound before NetherNet");
-            return None;
-        };
         let identity_key = match load_or_create_identity_key(&config.nethernet.identity_key) {
             Ok(key) => key,
             Err(err) => {
@@ -376,42 +365,11 @@ impl PumpkinServer {
         let _ = server.bedrock_private_key.set(identity_key.clone());
         let oidc_verifier = (config.online_mode && config.authentication.enabled)
             .then(|| server.bedrock_oidc_keys.clone());
-        match NetherNetListener::bind(
-            config.nethernet.address,
-            ice_socket,
-            config.nethernet.external_ip,
-            identity_key,
-            config.online_mode,
-            oidc_verifier,
-            config.nethernet.stun_servers.clone(),
-        )
-        .await
-        {
+        match NetherNetListener::bind(server, identity_key, oidc_verifier).await {
             Ok(l) => Some(l),
             Err(err) => {
-                error!("Failed to bind Bedrock NetherNet signaling endpoint: {err}");
+                error!("Failed to bind Bedrock NetherNet endpoint: {err}");
                 None
-            }
-        }
-    }
-
-    async fn bind_bedrock_status(server: &Server) -> (Option<StatusResponder>, Option<IceSocket>) {
-        let config = &server.advanced_config.networking.bedrock;
-        if !config.enabled || !config.nethernet.enabled {
-            return (None, None);
-        }
-        match StatusResponder::bind(config.nethernet.address).await {
-            Ok((responder, ice_socket)) => {
-                if let Ok((ipv4, ipv6)) = responder.local_addrs() {
-                    info!(
-                        "Bedrock server-list status is listening on {ipv4} (IPv4) and {ipv6} (IPv6)"
-                    );
-                }
-                (Some(responder), Some(ice_socket))
-            }
-            Err(err) => {
-                error!("Failed to bind Bedrock UDP status/ICE endpoint: {err}");
-                (None, None)
             }
         }
     }
@@ -641,17 +599,6 @@ impl PumpkinServer {
                         error!("Failed to accept Java client connection: {e}");
                         sleep(Duration::from_millis(50)).await;
                     }
-                }
-            },
-
-            // Remote server-list status remains a RakNet unconnected ping/pong even
-            // when the game connection itself is negotiated over NetherNet.
-            status_result = resolve_some(
-                self.bedrock_status.as_ref(),
-                |status: &StatusResponder| status.receive(&self.server),
-            ) => {
-                if let Err(error) = status_result {
-                    debug!("Bedrock status packet failed: {error}");
                 }
             },
 
