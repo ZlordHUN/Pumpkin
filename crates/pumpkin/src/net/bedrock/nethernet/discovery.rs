@@ -19,7 +19,7 @@ use tokio::{
 use tracing::{debug, trace, warn};
 use webrtc::peer_connection::RTCIceCandidateInit;
 
-use super::{NetherNetListener, negotiate};
+use super::{endpoint::NetherNetListener, peer::negotiate};
 use crate::server::Server;
 
 const DISCOVERY_PORT: u16 = 7551;
@@ -163,7 +163,7 @@ impl NetherNetDiscovery {
                 let (candidate_sender, candidate_receiver) = mpsc::unbounded_channel();
                 self.candidates.lock().await.insert(key, candidate_sender);
 
-                let state = listener.state.clone();
+                let state = listener.state();
                 let socket = self.socket.clone();
                 let candidates = self.candidates.clone();
                 let offer = data.to_owned();

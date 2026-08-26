@@ -344,17 +344,7 @@ impl PumpkinServer {
         let _ = server.bedrock_private_key.set(identity_key.clone());
         let oidc_verifier = (config.online_mode && config.authentication.enabled)
             .then(|| server.bedrock_oidc_keys.clone());
-        match NetherNetListener::bind(
-            config.nethernet.address,
-            ice_socket,
-            config.nethernet.external_ip,
-            identity_key,
-            config.online_mode,
-            oidc_verifier,
-            config.nethernet.stun_servers.clone(),
-        )
-        .await
-        {
+        match NetherNetListener::bind(server, ice_socket, identity_key, oidc_verifier).await {
             Ok(l) => Some(l),
             Err(err) => {
                 error!("Failed to bind Bedrock NetherNet signaling endpoint: {err}");
