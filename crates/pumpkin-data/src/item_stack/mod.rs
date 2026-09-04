@@ -884,6 +884,44 @@ mod tests {
     }
 
     #[test]
+    fn leaves_use_vanilla_hardness_and_tool_speeds() {
+        let tools = [
+            (&Item::AIR, 1.0f32),
+            (&Item::DIAMOND_AXE, 1.0),
+            (&Item::DIAMOND_PICKAXE, 1.0),
+            (&Item::SHEARS, 15.0),
+            (&Item::WOODEN_SWORD, 1.5),
+            (&Item::NETHERITE_SWORD, 1.5),
+            (&Item::WOODEN_HOE, 2.0),
+            (&Item::STONE_HOE, 4.0),
+            (&Item::COPPER_HOE, 5.0),
+            (&Item::IRON_HOE, 6.0),
+            (&Item::DIAMOND_HOE, 8.0),
+            (&Item::NETHERITE_HOE, 9.0),
+            (&Item::GOLDEN_HOE, 12.0),
+        ];
+
+        for name in crate::tag::Block::MINECRAFT_LEAVES.0 {
+            let leaves = Block::from_registry_key(name).expect("registered leaves block");
+            assert_eq!(leaves.hardness.to_bits(), 0.2f32.to_bits(), "{name}");
+            for state in leaves.states {
+                assert_eq!(state.hardness.to_bits(), 0.2f32.to_bits(), "{name}");
+                assert!(!state.tool_required(), "{name} should drop loot by hand");
+            }
+
+            for (item, expected_speed) in tools {
+                let stack = ItemStack::new(1, item);
+                assert_eq!(
+                    stack.get_speed(leaves).to_bits(),
+                    expected_speed.to_bits(),
+                    "{} mining {name}",
+                    item.registry_key,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn items_with_different_components_are_not_equal_in_either_direction() {
         let plain = ItemStack::new(1, &Item::COAL);
 

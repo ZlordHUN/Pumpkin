@@ -19,6 +19,7 @@ pub enum LootCondition {
         enchanted_chance_per_level_above_first: f32,
     },
     TableBonus {
+        enchantment: &'static str,
         chances: &'static [f32],
     },
     AllOf(&'static [Self]),
@@ -47,6 +48,8 @@ pub struct LootEntry {
     pub condition: LootCondition,
     /// Bonus formula to apply with fortune / looting (if any).
     pub bonus_formula: Option<LootBonusFormula>,
+    /// Whether each item in the resulting stack must survive the explosion.
+    pub explosion_decay: bool,
 }
 
 /// One roll pool inside a loot table.

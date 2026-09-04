@@ -316,6 +316,12 @@ use pumpkin_data::potion::Effect;
 const MAX_CACHED_SIGNATURES: u8 = 128; // Vanilla: 128
 const MAX_PREVIOUS_MESSAGES: u8 = 20; // Vanilla: 20
 
+const fn mining_progress(speed: f32, current_tick: i32, starting_tick: i32) -> f32 {
+    // Start packets record the counter before Player::tick advances it. The difference
+    // already includes this processing tick, so adding one would count it twice.
+    speed * (current_tick - starting_tick) as f32
+}
+
 fn write_root_vehicle(nbt: &mut NbtCompound, uuid: Uuid) {
     let value = uuid.as_u128();
     let mut root_vehicle = NbtCompound::new();
@@ -2758,9 +2764,12 @@ impl Player {
         state: &BlockState,
         starting_time: i32,
     ) -> bool {
-        let time = self.tick_counter.load(Ordering::Relaxed) - starting_time;
         let speed = block::calc_block_breaking(self, state, Block::from_state_id(state.id));
-        let total_progress = speed * (time + 1) as f32;
+        let total_progress = mining_progress(
+            speed,
+            self.tick_counter.load(Ordering::Relaxed),
+            starting_time,
+        );
         let stage = (total_progress * 10.0) as i32;
         let stage = stage.min(9);
         let old_speed = self
@@ -7694,9 +7703,63 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
-    use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
+    use super::{bedrock_inventory_slot, mining_progress, read_root_vehicle, write_root_vehicle};
+    use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
+
+    #[test]
+    fn leaves_mining_counts_each_processing_tick_once() {
+        let tools = [
+            (&Item::AIR, 6),
+            (&Item::WOODEN_HOE, 3),
+            (&Item::DIAMOND_SWORD, 4),
+            (&Item::STONE_HOE, 2),
+            (&Item::COPPER_HOE, 2),
+        ];
+        let starting_tick = 100;
+        for name in pumpkin_data::tag::Block::MINECRAFT_LEAVES.0 {
+            let leaves = Block::from_registry_key(name).expect("registered leaves block");
+            for (item, expected_ticks) in tools {
+                // Grounded survival mining without effects or enchantments. Leaves do
+                // not require a harvest tool, so their damage divisor is always 30.
+                let speed = ItemStack::new(1, item).get_speed(leaves)
+                    / leaves.default_state.hardness
+                    / 30.0;
+                for elapsed in 0..expected_ticks {
+                    assert!(
+                        mining_progress(speed, starting_tick + elapsed, starting_tick) < 1.0,
+                        "{} broke {name} early after {elapsed} processing ticks",
+                        item.registry_key,
+                    );
+                }
+                assert!(
+                    mining_progress(speed, starting_tick + expected_ticks, starting_tick) >= 1.0,
+                    "{} should break {name} after {expected_ticks} processing ticks",
+                    item.registry_key,
+                );
+            }
+
+            // These tools take the instant-break path in the start handler and do
+            // not need the continued-mining timer.
+            for item in [
+                &Item::SHEARS,
+                &Item::IRON_HOE,
+                &Item::DIAMOND_HOE,
+                &Item::NETHERITE_HOE,
+                &Item::GOLDEN_HOE,
+            ] {
+                let speed = ItemStack::new(1, item).get_speed(leaves)
+                    / leaves.default_state.hardness
+                    / 30.0;
+                assert!(
+                    speed >= 1.0,
+                    "{} should instantly break {name}",
+                    item.registry_key
+                );
+            }
+        }
+    }
 
     #[test]
     fn player_screen_slots_map_to_bedrock_inventory() {

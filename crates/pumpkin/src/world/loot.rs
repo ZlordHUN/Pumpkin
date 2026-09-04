@@ -59,8 +59,15 @@ fn check_condition(
             };
             rng.next_f32() < chance
         }
-        LootCondition::TableBonus { chances } => {
-            let index = (fortune_level.max(0) as usize).min(chances.len().saturating_sub(1));
+        LootCondition::TableBonus {
+            enchantment,
+            chances,
+        } => {
+            let level = params.tool.as_ref().map_or(0, |tool| {
+                pumpkin_data::Enchantment::from_name(enchantment)
+                    .map_or(0, |enchantment| tool.get_enchantment_level(enchantment))
+            });
+            let index = (level.max(0) as usize).min(chances.len().saturating_sub(1));
             chances
                 .get(index)
                 .is_some_and(|chance| rng.next_f32() < *chance)
@@ -106,6 +113,15 @@ fn apply_bonus_formula(
             base_count + bonus_count
         }
     }
+}
+
+fn apply_explosion_decay(count: i32, radius: Option<f32>, rng: &mut Xoroshiro) -> i32 {
+    let Some(radius) = radius else {
+        return count;
+    };
+    (0..count)
+        .filter(|_| rng.next_f32() <= 1.0 / radius)
+        .count() as i32
 }
 
 #[must_use]
@@ -213,6 +229,10 @@ pub fn generate_loot_with_context(
                         final_count =
                             apply_bonus_formula(final_count, bonus, fortune_level, &mut rng);
                     }
+                    if entry.explosion_decay {
+                        final_count =
+                            apply_explosion_decay(final_count, params.explosion_radius, &mut rng);
+                    }
 
                     if final_count > 0 {
                         let item_key = entry.item.strip_prefix("minecraft:").unwrap_or(entry.item);
@@ -311,5 +331,281 @@ fn shuffle_and_split_items(
     for i in (1..n).rev() {
         let j = rng.next_bounded_i32((i + 1) as i32) as usize;
         result.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::{Enchantment, loot_table};
+
+    const LEAF_TABLES: [(&LootTable, &str, Option<&str>, bool); 11] = [
+        (
+            &loot_table::BLOCKS_OAK_LEAVES,
+            "oak_leaves",
+            Some("oak_sapling"),
+            true,
+        ),
+        (
+            &loot_table::BLOCKS_DARK_OAK_LEAVES,
+            "dark_oak_leaves",
+            Some("dark_oak_sapling"),
+            true,
+        ),
+        (
+            &loot_table::BLOCKS_PALE_OAK_LEAVES,
+            "pale_oak_leaves",
+            Some("pale_oak_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_SPRUCE_LEAVES,
+            "spruce_leaves",
+            Some("spruce_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_BIRCH_LEAVES,
+            "birch_leaves",
+            Some("birch_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_JUNGLE_LEAVES,
+            "jungle_leaves",
+            Some("jungle_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_ACACIA_LEAVES,
+            "acacia_leaves",
+            Some("acacia_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_CHERRY_LEAVES,
+            "cherry_leaves",
+            Some("cherry_sapling"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_AZALEA_LEAVES,
+            "azalea_leaves",
+            Some("azalea"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_FLOWERING_AZALEA_LEAVES,
+            "flowering_azalea_leaves",
+            Some("flowering_azalea"),
+            false,
+        ),
+        (
+            &loot_table::BLOCKS_MANGROVE_LEAVES,
+            "mangrove_leaves",
+            None,
+            false,
+        ),
+    ];
+
+    fn enchanted_tool(enchantment: &'static Enchantment, level: u16) -> ItemStack {
+        let mut tool = ItemStack::new(1, &Item::DIAMOND_HOE);
+        tool.add_enchantment(enchantment, level);
+        tool
+    }
+
+    fn assert_drop_rate(observed: usize, samples: usize, chance: f64, label: &str) {
+        let expected = samples as f64 * chance;
+        let tolerance = 6.0 * (expected * (1.0 - chance)).sqrt() + 1.0;
+        assert!(
+            (observed as f64 - expected).abs() <= tolerance,
+            "{label}: got {observed}/{samples}, expected a chance of {chance}"
+        );
+    }
+
+    #[test]
+    fn leaf_tables_drop_only_leaves_with_shears_or_silk_touch() {
+        let mut silk_touch = enchanted_tool(&Enchantment::SILK_TOUCH, 1);
+        silk_touch.add_enchantment(&Enchantment::FORTUNE, 4);
+        for tool in [ItemStack::new(1, &Item::SHEARS), silk_touch] {
+            let params = LootContextParameters {
+                tool: Some(tool),
+                ..Default::default()
+            };
+            for (table, leaf, _, _) in LEAF_TABLES {
+                let expected_item = Item::from_registry_key(leaf).unwrap();
+                for seed in 0..128 {
+                    let drops = generate_loot_with_context(table, seed, &params);
+                    assert_eq!(drops.len(), 1, "{leaf}, seed {seed}");
+                    assert_eq!(drops[0].item.id, expected_item.id, "{leaf}, seed {seed}");
+                    assert_eq!(drops[0].item_count, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_drop_rates_match_vanilla_without_a_tool_and_with_fortune() {
+        // These probabilities are from the bundled vanilla 26.2 leaf loot tables.
+        const SAMPLES: usize = 20_000;
+        const SAPLING_CHANCES: [f64; 5] = [0.05, 0.0625, 0.083333336, 0.1, 0.1];
+        const JUNGLE_CHANCES: [f64; 5] = [0.025, 0.027777778, 0.03125, 0.041666668, 0.1];
+        const STICK_CHANCES: [f64; 5] = [0.02, 0.022222223, 0.025, 0.033333335, 0.1];
+        const APPLE_CHANCES: [f64; 5] = [0.005, 0.0055555557, 0.00625, 0.008333334, 0.025];
+
+        for (table, leaf, sapling, has_apples) in LEAF_TABLES {
+            for (level, default_sapling_chance) in SAPLING_CHANCES.into_iter().enumerate() {
+                let params = LootContextParameters {
+                    tool: (level > 0).then(|| enchanted_tool(&Enchantment::FORTUNE, level as u16)),
+                    ..Default::default()
+                };
+                let mut saplings = 0;
+                let mut sticks = [0; 2];
+                let mut apples = 0;
+                for seed in 0..SAMPLES as i64 {
+                    for drop in generate_loot_with_context(table, seed, &params) {
+                        let name = drop
+                            .item
+                            .registry_key
+                            .strip_prefix("minecraft:")
+                            .unwrap_or(drop.item.registry_key);
+                        match name {
+                            "stick" => {
+                                assert!((1..=2).contains(&drop.item_count));
+                                sticks[drop.item_count as usize - 1] += 1;
+                            }
+                            "apple" => {
+                                assert!(has_apples, "{leaf} must not drop apples");
+                                assert_eq!(drop.item_count, 1);
+                                apples += 1;
+                            }
+                            _ => {
+                                assert_eq!(Some(name), sapling, "unexpected {leaf} drop");
+                                assert_eq!(drop.item_count, 1);
+                                saplings += 1;
+                            }
+                        }
+                    }
+                }
+                let sapling_chance = if sapling.is_none() {
+                    0.0
+                } else if leaf == "jungle_leaves" {
+                    JUNGLE_CHANCES[level]
+                } else {
+                    default_sapling_chance
+                };
+                let label = format!("{leaf}, Fortune {level}");
+                assert_drop_rate(saplings, SAMPLES, sapling_chance, &label);
+                // Vanilla chooses one or two sticks with equal probability.
+                for count in sticks {
+                    assert_drop_rate(count, SAMPLES, STICK_CHANCES[level] / 2.0, &label);
+                }
+                assert_drop_rate(
+                    apples,
+                    SAMPLES,
+                    if has_apples {
+                        APPLE_CHANCES[level]
+                    } else {
+                        0.0
+                    },
+                    &label,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_drop_chances_ignore_looting() {
+        let params = LootContextParameters {
+            tool: Some(enchanted_tool(&Enchantment::LOOTING, 3)),
+            ..Default::default()
+        };
+        for (table, leaf, _, _) in LEAF_TABLES {
+            for seed in 0..256 {
+                let without_tool = generate_loot(table, seed);
+                let with_looting = generate_loot_with_context(table, seed, &params);
+                let contents = |drops: Vec<ItemStack>| {
+                    drops
+                        .into_iter()
+                        .map(|drop| (drop.item.id, drop.item_count))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    contents(without_tool),
+                    contents(with_looting),
+                    "{leaf}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn table_bonus_uses_the_requested_enchantment_and_clamps_its_level() {
+        let condition = LootCondition::TableBonus {
+            enchantment: "minecraft:fortune",
+            chances: &[0.0, 0.0, 1.0],
+        };
+        for (tool, expected) in [
+            (None, false),
+            (Some(enchanted_tool(&Enchantment::FORTUNE, 1)), false),
+            (Some(enchanted_tool(&Enchantment::FORTUNE, 2)), true),
+            (Some(enchanted_tool(&Enchantment::FORTUNE, 100)), true),
+            (Some(enchanted_tool(&Enchantment::LOOTING, 3)), false),
+        ] {
+            let params = LootContextParameters {
+                tool,
+                ..Default::default()
+            };
+            assert_eq!(
+                check_condition(
+                    condition,
+                    false,
+                    false,
+                    100,
+                    &params,
+                    &mut Xoroshiro::from_seed(0)
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn explosions_remove_individual_sticks_from_leaf_drops() {
+        const SAMPLES: usize = 20_000;
+        let params = LootContextParameters {
+            tool: Some(enchanted_tool(&Enchantment::FORTUNE, 4)),
+            explosion_radius: Some(2.0),
+            ..Default::default()
+        };
+        let mut sticks = [0; 2];
+        for seed in 0..SAMPLES as i64 {
+            for drop in
+                generate_loot_with_context(&loot_table::BLOCKS_MANGROVE_LEAVES, seed, &params)
+            {
+                assert_eq!(drop.item.id, Item::STICK.id);
+                assert!((1..=2).contains(&drop.item_count));
+                sticks[drop.item_count as usize - 1] += 1;
+            }
+        }
+        // A 10% chance of 1–2 sticks, each surviving independently with probability 1/2.
+        assert_drop_rate(sticks[0], SAMPLES, 0.05, "one surviving stick");
+        assert_drop_rate(sticks[1], SAMPLES, 0.0125, "two surviving sticks");
+    }
+
+    #[test]
+    fn leaf_saplings_and_apples_must_survive_explosions() {
+        let params = LootContextParameters {
+            explosion_radius: Some(f32::INFINITY),
+            ..Default::default()
+        };
+        for (table, leaf, _, _) in LEAF_TABLES {
+            for seed in 0..256 {
+                assert!(
+                    generate_loot_with_context(table, seed, &params).is_empty(),
+                    "{leaf}, seed {seed}"
+                );
+            }
+        }
     }
 }

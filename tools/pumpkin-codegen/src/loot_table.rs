@@ -95,7 +95,6 @@ enum EnchantedChanceStruct {
 struct ConditionStruct {
     #[serde(default)]
     condition: String,
-    #[allow(dead_code)]
     #[serde(default)]
     enchantment: Option<String>,
     #[serde(default)]
@@ -143,16 +142,21 @@ fn parse_condition(cond: &ConditionStruct) -> LootCondition {
                 enchanted_chance_per_level_above_first,
             }
         }
-        "minecraft:table_bonus" => {
-            let chances = cond.chances.clone().unwrap_or_default();
-            if chances.is_empty() {
-                LootCondition::None
-            } else {
-                LootCondition::TableBonus {
-                    chances: Box::leak(chances.into_boxed_slice()),
-                }
-            }
-        }
+        "minecraft:table_bonus" => LootCondition::TableBonus {
+            enchantment: Box::leak(
+                cond.enchantment
+                    .clone()
+                    .expect("table_bonus requires an enchantment")
+                    .into_boxed_str(),
+            ),
+            chances: Box::leak(
+                cond.chances
+                    .clone()
+                    .filter(|chances| !chances.is_empty())
+                    .expect("table_bonus requires at least one chance")
+                    .into_boxed_slice(),
+            ),
+        },
         "minecraft:all_of" => {
             if let Some(terms) = &cond.terms {
                 combine_conditions(terms)
@@ -315,6 +319,7 @@ struct ParsedEntry {
     max_count: i32,
     condition: LootCondition,
     bonus_formula: Option<LootBonusFormula>,
+    explosion_decay: bool,
 }
 
 fn extract_entries(
@@ -399,6 +404,10 @@ fn extract_entries_with_depth(
                     max_count,
                     condition: entry_cond,
                     bonus_formula,
+                    explosion_decay: entry
+                        .functions
+                        .iter()
+                        .any(|f| f.function == "minecraft:explosion_decay"),
                 });
             }
         }
@@ -425,6 +434,7 @@ fn extract_entries_with_depth(
                                 max_count: 1,
                                 condition: entry_cond,
                                 bonus_formula: None,
+                                explosion_decay: false,
                             });
                         }
                     }
@@ -577,9 +587,12 @@ fn condition_to_tokens(cond: LootCondition) -> TokenStream {
                 }
             }
         }
-        LootCondition::TableBonus { chances } => {
+        LootCondition::TableBonus {
+            enchantment,
+            chances,
+        } => {
             let values = chances.iter();
-            quote! { LootCondition::TableBonus { chances: &[#(#values),*] } }
+            quote! { LootCondition::TableBonus { enchantment: #enchantment, chances: &[#(#values),*] } }
         }
         LootCondition::AllOf(list) => {
             let tokens: Vec<TokenStream> = list.iter().copied().map(condition_to_tokens).collect();
@@ -639,6 +652,7 @@ fn emit_table(
                 let max_count = e.max_count;
                 let cond_tokens = condition_to_tokens(e.condition);
                 let bonus_tokens = bonus_to_tokens(e.bonus_formula);
+                let explosion_decay = e.explosion_decay;
 
                 quote! {
                     LootEntry {
@@ -648,6 +662,7 @@ fn emit_table(
                         max_count: #max_count,
                         condition: #cond_tokens,
                         bonus_formula: #bonus_tokens,
+                        explosion_decay: #explosion_decay,
                     }
                 }
             })
@@ -767,5 +782,90 @@ pub fn build() -> TokenStream {
     quote! {
         pub use pumpkin_util::loot_table::*;
         #all_tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_pool_entries(json: &str) -> Vec<Vec<ParsedEntry>> {
+        let table: ChestLootTableJson = serde_json::from_str(json).unwrap();
+        table
+            .pools
+            .iter()
+            .map(|pool| {
+                let mut entries = Vec::new();
+                let mut empty_weight = 0;
+                for entry in &pool.entries {
+                    extract_entries(entry, LootCondition::None, &mut entries, &mut empty_weight);
+                }
+                entries
+            })
+            .collect()
+    }
+
+    #[test]
+    fn oak_leaves_keep_tool_exclusion_explosion_and_fortune_conditions() {
+        let pools = parse_pool_entries(include_str!(
+            "../../../assets/datapacks/26_2/data/minecraft/loot_table/blocks/oak_leaves.json"
+        ));
+        assert_eq!(pools[0][0].condition, LootCondition::SilkTouchOrShears);
+        assert_eq!(pools[0][1].item, "minecraft:oak_sapling");
+        assert_eq!(
+            pools[0][1].condition,
+            LootCondition::AllOf(&[
+                LootCondition::NoSilkTouchOrShears,
+                LootCondition::AllOf(&[
+                    LootCondition::SurvivesExplosion,
+                    LootCondition::TableBonus {
+                        enchantment: "minecraft:fortune",
+                        chances: &[0.05, 0.0625, 0.083333336, 0.1],
+                    },
+                ]),
+            ])
+        );
+        assert_eq!(pools[1][0].item, "minecraft:stick");
+        assert_eq!((pools[1][0].min_count, pools[1][0].max_count), (1, 2));
+        assert!(pools[1][0].explosion_decay);
+        assert_eq!(
+            pools[1][0].condition,
+            LootCondition::TableBonus {
+                enchantment: "minecraft:fortune",
+                chances: &[0.02, 0.022222223, 0.025, 0.033333335, 0.1],
+            }
+        );
+        assert_eq!(pools[2][0].item, "minecraft:apple");
+        assert_eq!(
+            pools[2][0].condition,
+            LootCondition::AllOf(&[
+                LootCondition::SurvivesExplosion,
+                LootCondition::TableBonus {
+                    enchantment: "minecraft:fortune",
+                    chances: &[0.005, 0.0055555557, 0.00625, 0.008333334, 0.025],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn mangrove_sticks_keep_fortune_condition_inside_tool_alternative() {
+        let pools = parse_pool_entries(include_str!(
+            "../../../assets/datapacks/26_2/data/minecraft/loot_table/blocks/mangrove_leaves.json"
+        ));
+        assert_eq!(pools[0].len(), 2);
+        let sticks = &pools[0][1];
+        assert_eq!(sticks.item, "minecraft:stick");
+        assert!(sticks.explosion_decay);
+        assert_eq!(
+            sticks.condition,
+            LootCondition::AllOf(&[
+                LootCondition::NoSilkTouchOrShears,
+                LootCondition::TableBonus {
+                    enchantment: "minecraft:fortune",
+                    chances: &[0.02, 0.022222223, 0.025, 0.033333335, 0.1],
+                },
+            ])
+        );
     }
 }
