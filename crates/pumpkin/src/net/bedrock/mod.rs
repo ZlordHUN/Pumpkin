@@ -407,6 +407,18 @@ impl BedrockClient {
         self.player.store(Arc::new(Some(player)));
     }
 
+    /// Observes the normal FIFO without starting its network writer in tests.
+    #[cfg(test)]
+    pub(crate) async fn drain_outgoing_packets_for_test(&self) -> Vec<Bytes> {
+        let mut receiver = self.outgoing_packet_queue_recv.lock().await;
+        let receiver = receiver.as_mut().expect("test owns outgoing queue");
+        let mut packets = Vec::new();
+        while let Ok(packet) = receiver.try_recv() {
+            packets.push(packet.data);
+        }
+        packets
+    }
+
     pub async fn enqueue_packet(&self, packet_data: Bytes) {
         self.enqueue_packet_data(packet_data).await;
     }

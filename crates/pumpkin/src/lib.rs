@@ -64,6 +64,9 @@ pub mod server;
 pub mod telemetry;
 pub mod world;
 
+#[cfg(test)]
+mod test_support;
+
 pub struct LoggingConfig {
     pub color: bool,
     pub threads: bool,

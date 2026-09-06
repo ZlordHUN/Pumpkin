@@ -468,6 +468,9 @@ pub struct Player {
     /// Whether the client has reported that it has loaded.
     pub client_loaded: AtomicBool,
     pub bedrock_spawned: AtomicBool,
+    /// Initial player spawning is complete, so Bedrock may pair this player with others.
+    /// Unlike `client_loaded`, this stays true across teleports and respawns.
+    pub bedrock_player_tracking_ready: AtomicBool,
     /// Whether the player is frozen in place (movement locked for dialogues/cutscenes).
     pub is_movement_locked: AtomicBool,
     /// The amount of time (in ticks) the client has to report having finished loading before being timed out.
@@ -560,20 +563,30 @@ struct SkinMetadata {
 }
 
 fn fetch_texture(url: &str) -> Option<image::DynamicImage> {
-    let bytes = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let client = pumpkin_util::client();
-                client.get(url).send().await.ok()?.bytes().await.ok()
-            })
-        })?
-    } else {
-        tokio::runtime::Runtime::new().ok()?.block_on(async {
-            let client = pumpkin_util::client();
-            client.get(url).send().await.ok()?.bytes().await.ok()
-        })?
+    let request = async {
+        pumpkin_util::client()
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
     };
-    image::load_from_memory(&bytes).ok()
+    let bytes = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(request))
+    } else {
+        tokio::runtime::Runtime::new().ok()?.block_on(request)
+    }
+    .map_err(|error| {
+        warn!(
+            "Failed to download a player skin or cape texture: {}",
+            error.without_url()
+        );
+    })
+    .ok()?;
+    image::load_from_memory(&bytes)
+        .inspect_err(|error| warn!("Failed to decode a player skin or cape texture: {error}"))
+        .ok()
 }
 
 fn persona_piece_type(value: &str) -> Option<i32> {
@@ -971,6 +984,7 @@ impl Player {
             last_attacked_ticks: AtomicU32::new(0),
             client_loaded: AtomicBool::new(initially_loaded),
             bedrock_spawned: AtomicBool::new(false),
+            bedrock_player_tracking_ready: AtomicBool::new(false),
             client_loaded_timeout: AtomicU32::new(if initially_loaded { 0 } else { 60 }),
             chat_spam_tick_count: AtomicU32::new(0),
             // Item usage tracking
@@ -7967,6 +7981,66 @@ mod tests {
     use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn java_skin_download_checks_http_status_and_preserves_custom_pixels() {
+        use base64::Engine;
+        use image::ImageEncoder;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pixels = image::RgbaImage::from_pixel(64, 32, image::Rgba([30, 60, 90, 255]));
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&pixels, 64, 32, image::ColorType::Rgba8.into())
+            .unwrap();
+
+        for status in ["200 OK", "404 Not Found"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/skin.png", listener.local_addr().unwrap());
+            let body = png.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let mut response = header.into_bytes();
+                response.extend_from_slice(&body);
+                stream.write_all(&response).await.unwrap();
+            });
+            let property = pumpkin_protocol::Property {
+                name: "textures".into(),
+                value: base64::prelude::BASE64_STANDARD
+                    .encode(
+                        serde_json::json!({
+                            "textures": { "SKIN": { "url": url, "metadata": { "model": "slim" } } }
+                        })
+                        .to_string(),
+                    )
+                    .into(),
+                signature: None,
+            };
+            let skin = super::Player::fetch_skin(&[property]);
+            server.await.unwrap();
+            if status == "200 OK" {
+                let skin = skin.expect("a successfully downloaded Java skin must load");
+                assert_eq!((skin.image_width, skin.image_height), (64, 32));
+                assert_eq!(skin.skin_data, pixels.as_raw().as_slice());
+                assert_eq!(skin.skin_id, url);
+                assert_eq!(skin.arm_size, "slim");
+                assert!(skin.is_trusted);
+            } else {
+                assert!(
+                    skin.is_none(),
+                    "an HTTP error body is not a valid skin response"
+                );
+            }
+        }
+    }
 
     #[test]
     fn player_screen_slots_map_to_bedrock_inventory() {

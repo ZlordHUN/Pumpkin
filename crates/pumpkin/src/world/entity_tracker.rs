@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use bytes::BufMut;
 use crossbeam::atomic::AtomicCell;
@@ -25,6 +25,10 @@ use crate::net::ClientPlatform;
 use crate::net::java::JavaClient;
 use crate::world::World;
 use crate::world::chunker::{get_view_distance, is_within_view_distance};
+
+#[cfg(test)]
+#[path = "entity_tracker_tests.rs"]
+mod tests;
 
 pub struct TrackedEntity {
     pub entity: Arc<dyn EntityBase>,
@@ -97,6 +101,19 @@ impl TrackedEntity {
 
     pub fn update_player(&self, player: &Arc<Player>, _world: &World) {
         if player.get_entity().entity_id == self.entity_id {
+            return;
+        }
+
+        // Join code registers player-list skins before the tracker creates actors.
+        // Do not pair at the placeholder spawn position or while the Bedrock
+        // recipient is still initializing its world.
+        if matches!(player.client.as_ref(), ClientPlatform::Bedrock(_))
+            && let Some(subject) = self.entity.get_player()
+            && (!subject
+                .bedrock_player_tracking_ready
+                .load(Ordering::Acquire)
+                || !player.bedrock_player_tracking_ready.load(Ordering::Acquire))
+        {
             return;
         }
 

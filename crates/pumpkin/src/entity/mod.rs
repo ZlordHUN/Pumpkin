@@ -333,6 +333,30 @@ pub trait EntityBase: Send + Sync + std::any::Any {
     }
 
     fn send_bedrock_spawn_packet(&self, client: &BedrockClient) {
+        if let Some(player) = self.get_player() {
+            // Tracking can spawn a player again after they leave and re-enter view.
+            // Bedrock needs their skin registration followed by AddPlayer each time.
+            let (player_list, add_player) = World::bedrock_player_spawn_packets(player);
+            if let (Ok(player_list), Ok(add_player)) = (
+                client.serialize_packet(&player_list),
+                client.serialize_packet(&add_player),
+            ) {
+                client.try_enqueue_packet(player_list);
+                client.try_enqueue_packet(add_player);
+                let held_item = player.inventory.held_item();
+                client.try_enqueue_client_packet(
+                    &pumpkin_protocol::bedrock::client::CMobEquipment {
+                        target_runtime_id: (player.entity_id() as u64).into(),
+                        item: (&held_item).into(),
+                        slot: 0,
+                        selected_slot: 0,
+                        container_id: 0,
+                    },
+                );
+            }
+            return;
+        }
+
         let entity = self.get_entity();
         let runtime_id = entity.entity_id as u64;
         let identifier = self

@@ -558,6 +558,28 @@ pub struct NetherNetSession {
 }
 
 impl NetherNetSession {
+    /// Creates an unnegotiated loopback transport without discovery or external ICE servers.
+    #[cfg(test)]
+    pub(crate) async fn new_for_test() -> Self {
+        struct TestPeerEventHandler;
+
+        #[async_trait]
+        impl PeerConnectionEventHandler for TestPeerEventHandler {}
+
+        let address = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        let peer = Box::pin(
+            PeerConnectionBuilder::new()
+                .with_configuration(RTCConfigurationBuilder::default().build())
+                .with_handler(Arc::new(TestPeerEventHandler))
+                .with_udp_addrs(vec![address])
+                .build(),
+        )
+        .await
+        .expect("unconnected loopback test peer");
+        let (incoming, _) = mpsc::channel(1);
+        Self::new(Arc::new(peer), None, address, incoming)
+    }
+
     fn new(
         peer: Arc<dyn PeerConnection>,
         client_public_key: Option<PublicKey>,

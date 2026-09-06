@@ -3461,51 +3461,12 @@ impl World {
             &bedrock_player_list,
         );
 
-        let bedrock_add_player = CAddPlayer {
-            uuid: gameprofile.id,
-            player_name: gameprofile.name.clone(),
-            target_runtime_id: VarULong(runtime_id),
-            platform_chat_id: String::new(),
-            position: Vector3::new(position.x as f32, position.y as f32, position.z as f32),
-            velocity: Vector3::new(velocity.x as f32, velocity.y as f32, velocity.z as f32),
-            rotation: Vector2::new(pitch, yaw),
-            y_head_rotation: yaw,
-            carried_item: NetworkItemStackDescriptor::default(),
-            player_game_type: player.gamemode.load().into(),
-            entity_data: entity.bedrock_metadata(),
-            synced_properties: PropertySyncData::default(),
-            abilities_data: pumpkin_protocol::bedrock::client::SerializedAbilitiesData {
-                target_player_raw_id: runtime_id as i64,
-                player_permissions:
-                    pumpkin_protocol::bedrock::client::PlayerPermissionLevel::Visitor,
-                command_permissions: pumpkin_protocol::bedrock::client::CommandPermissionLevel::Any,
-                layers: vec![
-                    pumpkin_protocol::bedrock::client::SerializedAbilitiesDataSerializedLayer {
-                        serialized_layer: 0,
-                        abilities_set: 0,
-                        ability_value: 0,
-                        fly_speed: 0.05,
-                        vertical_fly_speed: 0.05,
-                        walk_speed: 0.1,
-                    },
-                ],
-            },
-            actor_links: Vec::new(),
-            device_id: String::new(),
-            build_platform: BuildPlatform::Unknown,
-        };
-
+        // Bedrock actors are spawned once by the tracker after initialization.
         for recipient in self.players.load().iter() {
-            if recipient.gameprofile.id == gameprofile.id {
-                continue;
-            }
-            match recipient.client.as_ref() {
-                ClientPlatform::Java(client) => Self::send_java_player_spawn(
-                    client, &player, position, pitch, yaw, yaw, velocity,
-                ),
-                ClientPlatform::Bedrock(client) => {
-                    client.try_enqueue_client_packet(&bedrock_add_player);
-                }
+            if recipient.gameprofile.id != gameprofile.id
+                && let ClientPlatform::Java(client) = recipient.client.as_ref()
+            {
+                Self::send_java_player_spawn(client, &player, position, pitch, yaw, yaw, velocity);
             }
         }
 
@@ -3521,7 +3482,7 @@ impl World {
             &actor_data,
         );
 
-        // 2. Spawn existing players for our new Bedrock client
+        // 2. Register existing skins before the tracker spawns their player actors.
         let players = self.players.load();
 
         for existing_player in players
@@ -3529,10 +3490,6 @@ impl World {
             .filter(|p| p.gameprofile.id != gameprofile.id)
         {
             let ex_profile = &existing_player.gameprofile;
-            let ex_entity = &existing_player.get_entity();
-            let ex_pos = ex_entity.pos.load();
-            let ex_vel = ex_entity.velocity.load();
-
             let ex_player_list = CPlayerList {
                 action: CPlayerList::ACTION_ADD,
                 entries: vec![PlayerListEntry {
@@ -3549,57 +3506,7 @@ impl World {
                     player_color: [0, 0, 0, 0],
                 }],
             };
-            // Send PlayerList FIRST
             client.send_packet(&ex_player_list).await;
-
-            let ex_add_player = CAddPlayer {
-                uuid: ex_profile.id,
-                player_name: ex_profile.name.clone(),
-                target_runtime_id: VarULong(existing_player.entity_id() as u64),
-                platform_chat_id: String::new(),
-                position: Vector3::new(ex_pos.x as f32, ex_pos.y as f32, ex_pos.z as f32),
-                velocity: Vector3::new(ex_vel.x as f32, ex_vel.y as f32, ex_vel.z as f32),
-                rotation: Vector2::new(ex_entity.pitch.load(), ex_entity.yaw.load()),
-                y_head_rotation: ex_entity.head_yaw.load(),
-                carried_item: NetworkItemStackDescriptor::default(),
-                player_game_type: existing_player.gamemode.load().into(),
-                entity_data: ex_entity.bedrock_metadata(),
-                synced_properties: PropertySyncData::default(),
-                abilities_data: pumpkin_protocol::bedrock::client::SerializedAbilitiesData {
-                    target_player_raw_id: existing_player.entity_id() as i64,
-                    player_permissions:
-                        pumpkin_protocol::bedrock::client::PlayerPermissionLevel::Visitor,
-                    command_permissions:
-                        pumpkin_protocol::bedrock::client::CommandPermissionLevel::Any,
-                    layers: vec![
-                        pumpkin_protocol::bedrock::client::SerializedAbilitiesDataSerializedLayer {
-                            serialized_layer: 0,
-                            abilities_set: 0,
-                            ability_value: 0,
-                            fly_speed: 0.05,
-                            vertical_fly_speed: 0.05,
-                            walk_speed: 0.1,
-                        },
-                    ],
-                },
-                actor_links: Vec::new(),
-                device_id: String::new(),
-                build_platform: BuildPlatform::Unknown,
-            };
-
-            client.send_packet(&ex_add_player).await;
-
-            let ex_held_item = existing_player.inventory().held_item();
-
-            let ex_be_mob_equipment = pumpkin_protocol::bedrock::client::CMobEquipment {
-                target_runtime_id: (existing_player.entity_id() as u64).into(),
-                item: (&ex_held_item).into(),
-                slot: 0,
-                selected_slot: 0,
-                container_id: 0,
-            };
-
-            client.send_packet(&ex_be_mob_equipment).await;
         }
 
         player.has_played_before.store(true, Ordering::Relaxed);
@@ -3944,41 +3851,7 @@ impl World {
 
         let gameprofile = &player.gameprofile;
 
-        let bedrock_add_player = CAddPlayer {
-            uuid: gameprofile.id,
-            player_name: gameprofile.name.clone(),
-            target_runtime_id: VarULong(entity_id as u64),
-            platform_chat_id: String::new(),
-            position: Vector3::new(position.x as f32, position.y as f32, position.z as f32),
-            velocity: Vector3::new(velocity.x as f32, velocity.y as f32, velocity.z as f32),
-            rotation: Vector2::new(pitch, yaw),
-            y_head_rotation: yaw,
-            carried_item: NetworkItemStackDescriptor::default(),
-            player_game_type: player.gamemode.load().into(),
-            entity_data: player.get_entity().bedrock_metadata(),
-            synced_properties: PropertySyncData::default(),
-            abilities_data: pumpkin_protocol::bedrock::client::SerializedAbilitiesData {
-                target_player_raw_id: entity_id as i64,
-                player_permissions:
-                    pumpkin_protocol::bedrock::client::PlayerPermissionLevel::Visitor,
-                command_permissions: pumpkin_protocol::bedrock::client::CommandPermissionLevel::Any,
-                layers: vec![
-                    pumpkin_protocol::bedrock::client::SerializedAbilitiesDataSerializedLayer {
-                        serialized_layer: 0,
-                        abilities_set: 0,
-                        ability_value: 0,
-                        fly_speed: 0.05,
-                        vertical_fly_speed: 0.05,
-                        walk_speed: 0.1,
-                    },
-                ],
-            },
-            actor_links: Vec::new(),
-            device_id: String::new(),
-            build_platform: BuildPlatform::Unknown,
-        };
-
-        // Spawn the player for every client.
+        // Bedrock player actors are owned by the tracker, including initial joins.
         let spawn_entity = CSpawnEntity::new(
             entity_id.into(),
             gameprofile.id,
@@ -3991,11 +3864,7 @@ impl World {
             velocity,
         );
 
-        self.broadcast_packet_except_editioned(
-            &[player.gameprofile.id],
-            &spawn_entity,
-            &bedrock_add_player,
-        );
+        self.broadcast_packet_except(&[player.gameprofile.id], &spawn_entity);
 
         // Broadcast metadata to Java players so they can correctly interact with the new player
         let skin_parts = player.config.load().skin_parts;
@@ -4230,6 +4099,7 @@ impl World {
 
         player.send_active_effects();
         player.breath_manager.send_air_supply(player);
+        self.start_bedrock_player_tracking(player);
         self.send_player_equipment(player);
 
         if let crate::net::ClientPlatform::Java(java_client) = player.client.as_ref()
@@ -4470,11 +4340,7 @@ impl World {
         }
     }
 
-    async fn refresh_java_player_for_bedrock(&self, subject: &Player) {
-        if !matches!(subject.client.as_ref(), ClientPlatform::Java(_)) {
-            return;
-        }
-
+    pub(crate) fn bedrock_player_spawn_packets(subject: &Player) -> (CPlayerList, CAddPlayer) {
         let entity = subject.get_entity();
         let entity_id = subject.entity_id();
         let position = entity.pos.load();
@@ -4528,10 +4394,27 @@ impl World {
             device_id: String::new(),
             build_platform: BuildPlatform::Unknown,
         };
-        let remove = CRemoveActor::new(VarLong(entity_id.into()));
+        (player_list, add_player)
+    }
+
+    async fn refresh_java_player_for_bedrock(&self, subject: &Player) {
+        if !matches!(subject.client.as_ref(), ClientPlatform::Java(_))
+            || !subject
+                .bedrock_player_tracking_ready
+                .load(Ordering::Acquire)
+        {
+            return;
+        }
+
+        let (player_list, add_player) = Self::bedrock_player_spawn_packets(subject);
+        let remove = CRemoveActor::new(VarLong(subject.entity_id().into()));
 
         for recipient in self.players.load().iter() {
-            if let ClientPlatform::Bedrock(client) = recipient.client.as_ref() {
+            if recipient
+                .bedrock_player_tracking_ready
+                .load(Ordering::Acquire)
+                && let ClientPlatform::Bedrock(client) = recipient.client.as_ref()
+            {
                 client.send_packet(&remove).await;
                 client.send_packet(&player_list).await;
                 client.send_packet(&add_player).await;
@@ -5313,6 +5196,16 @@ impl World {
     pub fn pair_new_player_with_tracked_entities(&self, player: &Arc<Player>) {
         self.entity_tracker
             .pair_new_player_with_tracked_entities(player, self);
+    }
+
+    /// Activate Bedrock player pairing after initial spawning, without waiting for movement.
+    pub(crate) fn start_bedrock_player_tracking(&self, player: &Arc<Player>) {
+        if !player
+            .bedrock_player_tracking_ready
+            .swap(true, Ordering::AcqRel)
+        {
+            self.entity_tracker.update_player_position(player, self);
+        }
     }
 
     /// Removes a player from the world and broadcasts a disconnect message if enabled.
