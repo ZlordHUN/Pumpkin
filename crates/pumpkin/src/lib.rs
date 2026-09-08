@@ -56,6 +56,8 @@ pub mod data;
 pub mod enchantment;
 pub mod entity;
 pub mod error;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod item;
 pub mod logging;
 pub mod net;
@@ -117,7 +119,7 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
         let (logger, rl): (
             ConsoleWriter,
             Option<Editor<PumpkinCommandCompleter, FileHistory>>,
-        ) = if advanced_config.commands.use_tty && stdin().is_terminal() {
+        ) = if advanced_config.commands.use_tty && stdin().is_terminal() && !gui_active() {
             let rl_config = Config::builder()
                 .auto_add_history(true)
                 .completion_type(rustyline::CompletionType::List)
@@ -171,6 +173,8 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
             let registry = tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer);
+            #[cfg(feature = "gui")]
+            let registry = registry.with(gui::active().cloned().map(gui::GuiLogLayer::new));
             if let Some(file_logger) = file_logger {
                 registry.with(file_logger).init();
             } else {
@@ -181,6 +185,8 @@ pub fn init_logger(advanced_config: &AdvancedConfiguration) {
             let registry = tracing_subscriber::registry()
                 .with(env_filter)
                 .with(fmt_layer);
+            #[cfg(feature = "gui")]
+            let registry = registry.with(gui::active().cloned().map(gui::GuiLogLayer::new));
             if let Some(file_logger) = file_logger {
                 registry.with(file_logger).init();
             } else {
@@ -214,6 +220,17 @@ pub static SERVER_EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 pub fn stop_server() {
     SHOULD_STOP.store(true, Ordering::Relaxed);
     STOP_INTERRUPT.cancel();
+}
+
+fn gui_active() -> bool {
+    #[cfg(feature = "gui")]
+    {
+        gui::active().is_some()
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        false
+    }
 }
 
 pub fn stop_or_exit_server() {
@@ -451,6 +468,7 @@ impl PumpkinServer {
 
     pub async fn start(&self) {
         if self.server.advanced_config.commands.use_console
+            && !gui_active()
             && let Some((wrapper, _, _)) = LOGGER_IMPL.wait()
         {
             if let Some(rl) = wrapper.take_readline() {
@@ -730,6 +748,19 @@ impl PumpkinServer {
     }
 }
 
+/// Shared console dispatch keeps the desktop and terminal on the same permission
+/// and plugin-event path.
+async fn dispatch_console_command(server: &Arc<Server>, command: &str) {
+    let mut event = ServerCommandEvent::new(command.to_owned());
+    server.plugin_manager.fire(server, &mut event).await;
+    if !event.cancelled {
+        server.command_dispatcher.load().handle_command(
+            &command::CommandSender::Console.into_source(server),
+            command,
+        );
+    }
+}
+
 fn setup_stdin_console(server: &Arc<Server>) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let rt = tokio::runtime::Handle::current();
@@ -755,17 +786,7 @@ fn setup_stdin_console(server: &Arc<Server>) {
         while !SHOULD_STOP.load(Ordering::Relaxed)
             && let Some(command) = rx.recv().await
         {
-            let mut event = ServerCommandEvent::new(command.clone());
-            server_clone
-                .plugin_manager
-                .fire(&server_clone, &mut event)
-                .await;
-            if !event.cancelled {
-                server_clone.command_dispatcher.load().handle_command(
-                    &command::CommandSender::Console.into_source(&server_clone),
-                    command.as_str(),
-                );
-            }
+            dispatch_console_command(&server_clone, &command).await;
         }
     });
 }
@@ -826,14 +847,7 @@ fn setup_console(mut rl: Editor<PumpkinCommandCompleter, FileHistory>, server: A
             };
 
             if let Some(line) = result {
-                let mut event = ServerCommandEvent::new(line.clone());
-                server.plugin_manager.fire(&server, &mut event).await;
-                if !event.cancelled {
-                    server.command_dispatcher.load().handle_command(
-                        &command::CommandSender::Console.into_source(&server),
-                        &line,
-                    );
-                }
+                dispatch_console_command(&server, &line).await;
                 let _ = tx_reply.send(1).await;
             } else {
                 break;

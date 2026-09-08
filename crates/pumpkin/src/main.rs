@@ -6,6 +6,13 @@
 #[cfg(target_os = "wasi")]
 compile_error!("Compiling for WASI targets is not supported!");
 
+mod cli;
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
+mod native_gui;
+
 use pumpkin_data::packet::CURRENT_MC_VERSION;
 use pumpkin_world::{CURRENT_BEDROCK_MC_PROTOCOL, CURRENT_BEDROCK_MC_VERSION};
 use std::{
@@ -44,9 +51,42 @@ static MAIN_THREAD: OnceLock<ThreadId> = OnceLock::new();
 // WARNING: All rayon calls from the tokio runtime must be non-blocking! This includes things
 // like `par_iter`. These should be spawned in the the rayon pool and then passed to the tokio
 // runtime with a channel! See `Level::fetch_chunks` as an example!
-#[allow(clippy::too_many_lines)]
-#[tokio::main]
-async fn main() {
+#[allow(clippy::print_stdout, clippy::print_stderr)]
+fn main() {
+    let mode = cli::LaunchMode::parse(std::env::args().skip(1)).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        exit(2);
+    });
+    match mode {
+        cli::LaunchMode::Help => {
+            println!(
+                "Pumpkin {CARGO_PKG_VERSION}\n\nUsage: pumpkin [--gui | --nogui]\n\n  --gui       Open the native server window (requires a GUI-enabled desktop build)\n  --nogui     Run without a window; also accepts vanilla's 'nogui'\n  --help      Show this help\n  --version   Show the server version\n\nGUI-enabled builds open a window automatically when a desktop display is available.\nBuild one with: cargo build -p pumpkin --features gui"
+            );
+            return;
+        }
+        cli::LaunchMode::Version => {
+            println!("Pumpkin {CARGO_PKG_VERSION}");
+            return;
+        }
+        _ => {}
+    }
+    let use_gui = mode
+        .use_gui(
+            cfg!(all(
+                feature = "gui",
+                any(
+                    target_os = "linux",
+                    target_os = "windows",
+                    target_os = "macos"
+                )
+            )),
+            cli::display_available(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            exit(2);
+        });
+
     let _ = MAIN_THREAD.set(thread::current().id());
 
     // reqwest is built with `rustls-no-provider`, so pick the ring provider (the one
@@ -63,6 +103,91 @@ async fn main() {
 
     #[cfg(feature = "console-subscriber")]
     console_subscriber::init();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to create the server runtime: {error}");
+            exit(1);
+        });
+
+    #[cfg(all(
+        feature = "gui",
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    ))]
+    if use_gui {
+        run_desktop(&runtime);
+    } else {
+        runtime.block_on(run_server());
+    }
+    #[cfg(not(all(
+        feature = "gui",
+        any(target_os = "linux", target_os = "windows", target_os = "macos")
+    )))]
+    {
+        debug_assert!(!use_gui);
+        runtime.block_on(run_server());
+    }
+
+    exit(SERVER_EXIT_CODE.load(Ordering::Acquire));
+}
+
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
+#[allow(clippy::print_stderr)]
+fn run_desktop(runtime: &tokio::runtime::Runtime) {
+    use futures::FutureExt;
+    use pumpkin::gui::GuiHandle;
+
+    let gui = GuiHandle::new();
+    assert!(gui.clone().install().is_ok(), "GUI already initialized");
+    let backend_gui = gui.clone();
+    let backend = runtime.spawn(async move {
+        let result = std::panic::AssertUnwindSafe(run_server())
+            .catch_unwind()
+            .await;
+        let error = if result.is_err() {
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+            if let Some(report) = CRASH_REPORT.get() {
+                report.print_to_console();
+                report.save_and_log();
+            }
+            Some("The server encountered a fatal error. See the crash report and log.".to_owned())
+        } else if SERVER_EXIT_CODE.load(Ordering::Acquire) != 0 {
+            Some("The server stopped with an error. See the log for details.".to_owned())
+        } else {
+            None
+        };
+        backend_gui.finish(error);
+    });
+
+    // The native event loop belongs to the OS main thread. Server work stays on
+    // Tokio; never tear its runtime down while worlds are still being saved.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        native_gui::run(gui.clone())
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("Unable to open the server window: {error}");
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+        }
+        Err(_) => {
+            eprintln!("The server window failed; waiting for the server to save and stop.");
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+        }
+    }
+    gui.request_stop();
+    if let Err(error) = runtime.block_on(backend) {
+        eprintln!("Server task failed: {error}");
+        SERVER_EXIT_CODE.store(1, Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_server() {
     let time = Instant::now();
 
     let exec_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -176,6 +301,11 @@ async fn main() {
         }
     );
 
+    #[cfg(feature = "gui")]
+    if let Some(gui) = pumpkin::gui::active() {
+        gui.attach_server(&pumpkin_server.server);
+    }
+
     pumpkin_server.start().await;
 
     info!(
@@ -184,8 +314,6 @@ async fn main() {
             .color_named(NamedColor::Red)
             .to_pretty_console()
     );
-
-    exit(SERVER_EXIT_CODE.load(Ordering::Acquire));
 }
 fn print_support_links_and_warning() {
     warn!(
@@ -248,7 +376,14 @@ fn handle_panic(panic_info: &PanicHookInfo<'_>) {
 
     let payload = panic_info.payload();
 
-    if is_main_thread() {
+    #[cfg(feature = "gui")]
+    let desktop_active = pumpkin::gui::active().is_some();
+    #[cfg(not(feature = "gui"))]
+    let desktop_active = false;
+
+    // A desktop-window panic is caught by run_desktop, which can still wait for
+    // the backend to save. A panic in the headless main future cannot do that.
+    if is_main_thread() && !desktop_active {
         // It's the first panic;
         // We cannot gracefully shut down as the main thread
         // has panicked. However, we can still generate the crash report.
