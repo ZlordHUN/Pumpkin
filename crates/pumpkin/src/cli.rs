@@ -3,6 +3,8 @@ pub enum LaunchMode {
     #[default]
     Auto,
     Gui,
+    /// Private subprocess mode used by the desktop supervisor.
+    GuiBackend,
     Headless,
     Help,
     Version,
@@ -14,6 +16,7 @@ impl LaunchMode {
         for arg in args {
             let next = match arg.as_str() {
                 "--gui" => Self::Gui,
+                "--gui-backend" => Self::GuiBackend,
                 "--nogui" | "nogui" => Self::Headless,
                 "--help" | "-h" => return Ok(Self::Help),
                 "--version" | "-V" => return Ok(Self::Version),
@@ -29,7 +32,7 @@ impl LaunchMode {
 
     pub fn use_gui(self, supported: bool, display_available: bool) -> Result<bool, String> {
         match self {
-            Self::Gui if !supported => Err(
+            Self::Gui | Self::GuiBackend if !supported => Err(
                 "This build has no desktop GUI. Build on Linux, Windows or macOS with --features gui."
                     .to_owned(),
             ),
@@ -38,7 +41,7 @@ impl LaunchMode {
             }
             Self::Gui => Ok(true),
             Self::Auto => Ok(supported && display_available),
-            Self::Headless | Self::Help | Self::Version => Ok(false),
+            Self::GuiBackend | Self::Headless | Self::Help | Self::Version => Ok(false),
         }
     }
 }
@@ -96,5 +99,13 @@ mod tests {
         assert!(LaunchMode::Gui.use_gui(false, true).is_err());
         assert!(LaunchMode::Gui.use_gui(true, false).is_err());
         assert_eq!(LaunchMode::Gui.use_gui(true, true), Ok(true));
+    }
+
+    #[test]
+    fn private_backend_does_not_open_another_window() {
+        assert_eq!(parse(&["--gui-backend"]).unwrap(), LaunchMode::GuiBackend);
+        assert_eq!(LaunchMode::GuiBackend.use_gui(true, false), Ok(false));
+        assert!(LaunchMode::GuiBackend.use_gui(false, true).is_err());
+        assert!(parse(&["--gui-backend", "--gui"]).is_err());
     }
 }

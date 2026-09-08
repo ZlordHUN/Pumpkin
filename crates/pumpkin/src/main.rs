@@ -89,22 +89,27 @@ fn main() {
 
     let _ = MAIN_THREAD.set(thread::current().id());
 
-    // reqwest is built with `rustls-no-provider`, so pick the ring provider (the one
-    // wasmtime-wasi-http/rtc already force) before any client can be constructed.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    // Initialize global Rayon thread pool with named worker threads
-    let _ = rayon::ThreadPoolBuilder::new()
-        .thread_name(|i| format!("Rayon-Worker-{i}"))
-        .build_global();
+    if !use_gui {
+        // Server services live in the backend, not the desktop supervisor.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("Rayon-Worker-{i}"))
+            .build_global();
+    }
 
     // Set the panic handler.
     std::panic::set_hook(Box::new(handle_panic));
 
     #[cfg(feature = "console-subscriber")]
-    console_subscriber::init();
+    if !use_gui {
+        console_subscriber::init();
+    }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    if use_gui {
+        runtime_builder.worker_threads(2);
+    }
+    let runtime = runtime_builder
         .enable_all()
         .build()
         .unwrap_or_else(|error| {
@@ -116,7 +121,9 @@ fn main() {
         feature = "gui",
         any(target_os = "linux", target_os = "windows", target_os = "macos")
     ))]
-    if use_gui {
+    if mode == cli::LaunchMode::GuiBackend {
+        runtime.block_on(run_gui_backend());
+    } else if use_gui {
         run_desktop(&runtime);
     } else {
         runtime.block_on(run_server());
@@ -141,31 +148,47 @@ fn main() {
 fn run_desktop(runtime: &tokio::runtime::Runtime) {
     use futures::FutureExt;
     use pumpkin::gui::GuiHandle;
+    use tokio_util::sync::CancellationToken;
 
-    let gui = GuiHandle::new();
+    let (gui, desired) = GuiHandle::new_managed();
     assert!(gui.clone().install().is_ok(), "GUI already initialized");
-    let backend_gui = gui.clone();
+    let shutdown = CancellationToken::new();
+    let supervisor_gui = gui.clone();
+    let supervisor_shutdown = shutdown.clone();
     let backend = runtime.spawn(async move {
-        let result = std::panic::AssertUnwindSafe(run_server())
-            .catch_unwind()
-            .await;
-        let error = if result.is_err() {
-            SERVER_EXIT_CODE.store(1, Ordering::Release);
-            if let Some(report) = CRASH_REPORT.get() {
-                report.print_to_console();
-                report.save_and_log();
-            }
-            Some("The server encountered a fatal error. See the crash report and log.".to_owned())
-        } else if SERVER_EXIT_CODE.load(Ordering::Acquire) != 0 {
-            Some("The server stopped with an error. See the log for details.".to_owned())
-        } else {
-            None
+        let task = async {
+            pumpkin::gui::process::run_supervisor(
+                supervisor_gui.clone(),
+                desired,
+                supervisor_shutdown,
+                std::env::current_exe()?,
+                std::env::current_dir()?,
+            )
+            .await
         };
-        backend_gui.finish(error);
+        let error = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("Server supervisor failed: {error}")),
+            Err(_) => Some("The server supervisor encountered a fatal error.".to_owned()),
+        };
+        if let Some(error) = error {
+            supervisor_gui.finish(Some(error));
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+        }
+    });
+    let signal_gui = gui.clone();
+    let signal_task = runtime.spawn(async move {
+        match wait_for_signal().await {
+            Ok(()) => signal_gui.request_close(),
+            Err(error) => signal_gui.push_log(
+                tracing::Level::WARN,
+                &format!("Unable to set up signal handlers: {error}"),
+            ),
+        }
     });
 
-    // The native event loop belongs to the OS main thread. Server work stays on
-    // Tokio; never tear its runtime down while worlds are still being saved.
+    // Keep the OS event loop alive between backend runs. Do not abandon a child
+    // while it is saving, including if opening or rendering the window fails.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         native_gui::run(gui.clone())
     })) {
@@ -179,10 +202,72 @@ fn run_desktop(runtime: &tokio::runtime::Runtime) {
             SERVER_EXIT_CODE.store(1, Ordering::Release);
         }
     }
-    gui.request_stop();
+    gui.request_close();
+    shutdown.cancel();
     if let Err(error) = runtime.block_on(backend) {
         eprintln!("Server task failed: {error}");
         SERVER_EXIT_CODE.store(1, Ordering::Release);
+    }
+    signal_task.abort();
+}
+
+#[cfg(all(
+    feature = "gui",
+    any(target_os = "linux", target_os = "windows", target_os = "macos")
+))]
+#[allow(clippy::print_stderr)]
+async fn run_gui_backend() {
+    use futures::FutureExt;
+    use pumpkin::gui::{GuiHandle, process};
+    use tokio_util::sync::CancellationToken;
+
+    // Authenticate before loading a world or opening server ports.
+    let connection = match process::connect_backend().await {
+        Ok(connection) => connection,
+        Err(error) => {
+            eprintln!("Unable to connect to the server window: {error}");
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+            return;
+        }
+    };
+    let gui = GuiHandle::new();
+    assert!(
+        gui.clone().install().is_ok(),
+        "GUI bridge already initialized"
+    );
+    let finished = CancellationToken::new();
+    let transport = tokio::spawn(process::serve_backend(
+        connection,
+        gui.clone(),
+        finished.clone(),
+    ));
+    let result = std::panic::AssertUnwindSafe(run_server())
+        .catch_unwind()
+        .await;
+    let error = if result.is_err() {
+        SERVER_EXIT_CODE.store(1, Ordering::Release);
+        if let Some(report) = CRASH_REPORT.get() {
+            report.print_to_console();
+            report.save_and_log();
+        }
+        Some("The server encountered a fatal error. See the crash report and log.".to_owned())
+    } else if SERVER_EXIT_CODE.load(Ordering::Acquire) != 0 {
+        Some("The server stopped with an error. See the log for details.".to_owned())
+    } else {
+        None
+    };
+    gui.finish(error);
+    finished.cancel();
+    match transport.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("Server window connection ended: {error}");
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+        }
+        Err(error) => {
+            eprintln!("Server window transport failed: {error}");
+            SERVER_EXIT_CODE.store(1, Ordering::Release);
+        }
     }
 }
 
@@ -355,6 +440,13 @@ fn handle_interrupt() {
             .color_named(NamedColor::Red)
             .to_pretty_console()
     );
+    #[cfg(feature = "gui")]
+    if pumpkin::gui::active().is_some() {
+        // One terminal signal can reach both the window and its child. The
+        // window's IPC Stop may already be saving; never force-exit that child.
+        stop_server();
+        return;
+    }
     stop_or_exit_server();
 }
 
@@ -455,19 +547,19 @@ fn try_set_crash_report(crash_report: CrashReport) -> Option<&'static CrashRepor
     }
 }
 
-// Non-UNIX Ctrl-C handling
-#[cfg(not(unix))]
 async fn setup_sighandler() -> io::Result<()> {
-    if ctrl_c().await.is_ok() {
-        handle_interrupt();
-    }
-
+    wait_for_signal().await?;
+    handle_interrupt();
     Ok(())
 }
 
-// Unix signal handling
+#[cfg(not(unix))]
+async fn wait_for_signal() -> io::Result<()> {
+    ctrl_c().await
+}
+
 #[cfg(unix)]
-async fn setup_sighandler() -> io::Result<()> {
+async fn wait_for_signal() -> io::Result<()> {
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let mut terminate = signal(SignalKind::terminate())?;
@@ -478,8 +570,8 @@ async fn setup_sighandler() -> io::Result<()> {
         received = terminate.recv() => received,
     };
 
-    if received.is_some() {
-        handle_interrupt();
+    if received.is_none() {
+        return Err(io::Error::other("Signal stream closed"));
     }
 
     Ok(())

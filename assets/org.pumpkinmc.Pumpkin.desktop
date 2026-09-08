@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pumpkin Server
+Comment=Minecraft Java and Bedrock server
+Exec=pumpkin --gui
+Icon=org.pumpkinmc.Pumpkin
+Terminal=false
+# Associate running windows without adding a launcher with an unspecified server directory.
+NoDisplay=true
+StartupWMClass=org.pumpkinmc.Pumpkin

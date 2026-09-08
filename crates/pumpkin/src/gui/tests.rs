@@ -89,17 +89,43 @@ fn snapshots_are_owned_copies_and_finish_clears_online_state() {
             edition: "Java".to_string(),
         });
         snapshot.tps = 20.0;
+        snapshot.record_memory_sample(1234);
         snapshot.sample_id = 4;
     };
     let mut copy = handle.snapshot();
     copy.players.clear();
+    copy.memory_history.clear();
     assert_eq!(handle.snapshot().players.len(), 1);
+    assert_eq!(handle.snapshot().memory_history, VecDeque::from([1234]));
     handle.finish(None);
     let finished = handle.snapshot();
     assert!(finished.players.is_empty());
     assert_eq!(finished.tps, 0.0);
     assert_eq!(finished.sample_id, 4);
+    assert_eq!(finished.memory_bytes, 1234);
+    assert_eq!(finished.memory_history, VecDeque::from([1234]));
     assert!(!finished.commands_enabled);
+}
+
+#[test]
+fn memory_history_retains_the_latest_256_samples_in_order_after_failure() {
+    let handle = running_handle();
+    {
+        let mut snapshot = handle.state.snapshot.lock().unwrap();
+        assert!(snapshot.memory_history.is_empty());
+        for sample in 0..=300 {
+            snapshot.record_memory_sample(sample);
+        }
+    }
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.memory_bytes, 300);
+    assert_eq!(snapshot.memory_history.len(), MEMORY_HISTORY_CAPACITY);
+    assert!(snapshot.memory_history.iter().copied().eq(45..=300));
+    handle.finish(Some("backend failed".to_string()));
+    let finished = handle.snapshot();
+    assert_eq!(finished.status, ServerStatus::Failed);
+    assert_eq!(finished.memory_bytes, 300);
+    assert_eq!(finished.memory_history, snapshot.memory_history);
 }
 
 #[test]
@@ -186,4 +212,217 @@ fn tracing_layer_captures_messages_fields_and_levels_without_global_install() {
     assert!(logs[0].text.contains("count=7"));
     assert!(!logs[0].text.contains('\x1b'));
     assert_eq!(logs[1].text.len(), MAX_LOG_BYTES);
+}
+
+#[test]
+fn managed_restart_resets_session_state_after_draining_old_commands() {
+    let (handle, desired) = GuiHandle::new_managed();
+    let mut commands = handle.take_command_receiver().unwrap();
+    assert!(handle.take_command_receiver().is_none());
+    assert!(*desired.borrow());
+    assert_eq!(handle.snapshot().uptime, Duration::ZERO);
+    assert!(handle.request_start().is_err());
+
+    let mut first = running_handle().snapshot();
+    first.players.push(GuiPlayer {
+        name: "Alex".to_string(),
+        edition: "Java".to_string(),
+    });
+    first.record_memory_sample(1234);
+    first.uptime = Duration::from_secs(42);
+    first.sample_id = 84;
+    first.tps = 19.0;
+    first.mspt = 12.0;
+    first.target_tps = 10.0;
+    first.tick_frozen = true;
+    handle.apply_backend_update(first, Vec::new());
+    assert_eq!(handle.snapshot().uptime, Duration::from_secs(42));
+    handle.submit_command("old command").unwrap();
+
+    // The supervisor disables command admission before draining/reaping, then exposes Start.
+    handle.request_stop();
+    assert!(!*desired.borrow());
+    assert!(handle.submit_command("late old command").is_err());
+    assert_eq!(commands.try_recv().unwrap(), "old command");
+    assert!(commands.try_recv().is_err());
+    handle.finish(Some("first backend failed".to_string()));
+    assert!(!*desired.borrow());
+    assert_eq!(handle.snapshot().uptime, Duration::from_secs(42));
+    assert_eq!(handle.snapshot().memory_history, VecDeque::from([1234]));
+
+    handle.request_start().unwrap();
+    assert!(*desired.borrow());
+    let second = handle.snapshot();
+    assert_eq!(second.status, ServerStatus::Starting);
+    assert!(second.players.is_empty());
+    assert!(second.memory_history.is_empty());
+    assert_eq!(second.memory_bytes, 0);
+    assert_eq!(second.sample_id, 0);
+    assert_eq!(second.uptime, Duration::ZERO);
+    assert_eq!(second.tps, 0.0);
+    assert_eq!(second.mspt, 0.0);
+    assert_eq!(second.target_tps, 20.0);
+    assert!(!second.tick_frozen);
+    assert!(second.last_error.is_none());
+    assert!(!second.commands_enabled);
+    assert!(handle.submit_command("too early").is_err());
+    assert!(handle.request_start().is_err());
+    assert_eq!(handle.drain_logs()[0].text, "first backend failed");
+
+    handle.apply_backend_update(running_handle().snapshot(), Vec::new());
+    handle.submit_command("new command").unwrap();
+    assert_eq!(commands.try_recv().unwrap(), "new command");
+    assert!(commands.try_recv().is_err());
+    handle.request_stop();
+    handle.finish(None);
+    assert_eq!(handle.snapshot().status, ServerStatus::Stopped);
+    assert!(!*desired.borrow());
+    handle.request_start().unwrap();
+    assert!(*desired.borrow());
+}
+
+#[test]
+fn managed_terminal_updates_wait_for_reaping_and_cannot_undo_stop() {
+    for terminal in [ServerStatus::Stopped, ServerStatus::Failed] {
+        let (handle, _) = GuiHandle::new_managed();
+        let mut update = running_handle().snapshot();
+        update.status = terminal;
+        update.uptime = Duration::from_secs(17);
+        handle.apply_backend_update(update, Vec::new());
+        assert_eq!(handle.snapshot().status, ServerStatus::Stopping);
+        assert!(!handle.snapshot().commands_enabled);
+        assert!(handle.request_start().is_err());
+        assert!(handle.submit_command("list").is_err());
+
+        handle.apply_backend_update(running_handle().snapshot(), Vec::new());
+        assert_eq!(handle.snapshot().status, ServerStatus::Stopping);
+        assert!(!handle.snapshot().commands_enabled);
+        handle.finish(None);
+        handle.apply_backend_update(running_handle().snapshot(), Vec::new());
+        assert_eq!(handle.snapshot().status, ServerStatus::Stopped);
+    }
+
+    let (handle, _) = GuiHandle::new_managed();
+    handle.request_stop();
+    handle.apply_backend_update(running_handle().snapshot(), Vec::new());
+    assert_eq!(handle.snapshot().status, ServerStatus::Stopping);
+    assert!(!handle.snapshot().commands_enabled);
+}
+
+#[test]
+fn restart_rejects_a_missing_supervisor_and_preserves_terminal_details() {
+    for error in [None, Some("supervisor wait failed".to_string())] {
+        let (handle, supervisor) = GuiHandle::new_managed();
+        let mut update = running_handle().snapshot();
+        update.record_memory_sample(4096);
+        update.uptime = Duration::from_secs(12);
+        handle.apply_backend_update(update, Vec::new());
+        drop(supervisor);
+        handle.finish(error);
+        let before = serde_json::to_value(handle.snapshot()).unwrap();
+
+        assert!(handle.request_start().unwrap_err().contains("supervisor"));
+        assert_eq!(serde_json::to_value(handle.snapshot()).unwrap(), before);
+        assert!(!*handle.state.desired_running.as_ref().unwrap().borrow());
+        assert!(handle.submit_command("list").is_err());
+    }
+}
+
+#[test]
+fn window_close_requests_stop_and_prevents_restart_without_global_cancellation() {
+    let (handle, desired) = GuiHandle::new_managed();
+    assert!(!handle.close_requested());
+    handle.request_close();
+    assert!(handle.close_requested());
+    assert!(!*desired.borrow());
+    assert_eq!(handle.snapshot().status, ServerStatus::Stopping);
+    handle.request_close();
+    handle.finish(None);
+    assert!(handle.request_start().is_err());
+    assert!(!*desired.borrow());
+
+    let local = GuiHandle::new();
+    local.finish(None);
+    assert!(local.request_start().is_err());
+}
+
+#[test]
+fn backend_updates_drain_at_most_64_log_rows_in_order() {
+    let handle = GuiHandle::new();
+    for index in 0..MAX_UPDATE_LOGS + 3 {
+        handle.push_log(Level::INFO, &format!("line {index}"));
+    }
+    let (_, first) = handle.backend_update();
+    assert_eq!(first.len(), MAX_UPDATE_LOGS);
+    assert_eq!(first[0].text, "line 0");
+    assert_eq!(first.last().unwrap().text, "line 63");
+    let (_, next) = handle.backend_update();
+    assert_eq!(next.len(), 3);
+    assert_eq!(next[0].text, "line 64");
+    assert!(handle.backend_update().1.is_empty());
+}
+
+#[test]
+fn mirrored_logs_and_memory_history_remain_bounded_and_sanitized() {
+    let (handle, _) = GuiHandle::new_managed();
+    let mut update = running_handle().snapshot();
+    update.memory_history = (0..300).collect();
+    let log = LogLine {
+        timestamp: "\x1b[31m12:34:56\x1b[0m".to_string(),
+        level: Level::WARN,
+        text: format!("\x1b[31m{}\x1b[0m", "x".repeat(MAX_LOG_BYTES + 1)),
+    };
+    for _ in 0..=(MAX_LOG_LINES / MAX_UPDATE_LOGS) {
+        handle.apply_backend_update(update.clone(), vec![log.clone(); MAX_UPDATE_LOGS]);
+    }
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.memory_history.len(), MEMORY_HISTORY_CAPACITY);
+    assert!(snapshot.memory_history.iter().copied().eq(44..300));
+    let logs = handle.drain_logs();
+    assert_eq!(logs.len(), MAX_LOG_LINES);
+    assert!(logs.iter().all(|line| {
+        line.timestamp == "12:34:56"
+            && line.level == Level::WARN
+            && line.text.len() == MAX_LOG_BYTES
+            && !line.text.contains('\x1b')
+    }));
+}
+
+#[test]
+fn snapshots_and_log_levels_round_trip_through_ipc_serialization() {
+    let mut snapshot = running_handle().snapshot();
+    snapshot.record_memory_sample(4096);
+    snapshot.uptime = Duration::new(12, 345);
+    snapshot.players.push(GuiPlayer {
+        name: "Alex".to_string(),
+        edition: "Bedrock".to_string(),
+    });
+    for level in [
+        Level::TRACE,
+        Level::DEBUG,
+        Level::INFO,
+        Level::WARN,
+        Level::ERROR,
+    ] {
+        let update = (
+            snapshot.clone(),
+            vec![LogLine {
+                timestamp: "12:34:56".to_string(),
+                level,
+                text: "A console reply".to_string(),
+            }],
+        );
+        let encoded = serde_json::to_string(&update).unwrap();
+        let decoded: (ServerSnapshot, Vec<LogLine>) = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.1[0].level, level);
+        assert_eq!(decoded.0.uptime, snapshot.uptime);
+        assert_eq!(decoded.0.memory_history, snapshot.memory_history);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+    assert!(
+        serde_json::from_str::<LogLine>(
+            r#"{"timestamp":"12:34:56","level":"INVALID","text":"bad level"}"#,
+        )
+        .is_err()
+    );
 }

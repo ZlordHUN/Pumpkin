@@ -139,7 +139,7 @@ eframe = { version = "0.36.2", optional = true, default-features = false, featur
 
 [features]
 console-subscriber = ["dep:console-subscriber"]
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "tokio/process"]
 
 [lints]
 workspace = true
