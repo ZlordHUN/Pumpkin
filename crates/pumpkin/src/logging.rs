@@ -82,6 +82,17 @@ macro_rules! plugin_log {
 const LOG_DIR: &str = "logs";
 const MAX_ATTEMPTS: u32 = 1000;
 
+// Logger diagnostics can happen before tracing is initialized or inside a
+// tracing layer. Forward directly without dropping them or logging recursively.
+#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+fn logger_diagnostic(level: tracing::Level, message: &str) {
+    eprintln!("{message}");
+    #[cfg(feature = "gui")]
+    if let Some(gui) = crate::gui::active() {
+        gui.push_log(level, message);
+    }
+}
+
 /// A wrapper for our logger to hold the terminal input while no input is expected in order to
 /// properly flush logs to the output while they happen instead of batched
 pub struct ReadlineLogWrapper {
@@ -164,9 +175,12 @@ impl GzipRollingLogger {
 
         // If latest.log exists, we will gzip it
         if latest_path.exists() {
-            eprintln!(
-                "Found existing log file at '{}', gzipping it now...",
-                latest_path.display()
+            logger_diagnostic(
+                tracing::Level::INFO,
+                &format!(
+                    "Found existing log file at '{}', gzipping it now...",
+                    latest_path.display()
+                ),
             );
 
             let new_gz_path = Self::new_filename(true)?;
@@ -233,9 +247,12 @@ impl GzipRollingLogger {
         }
 
         if let Some((path, _)) = oldest_log {
-            eprintln!(
-                "Max log ids ({MAX_ATTEMPTS}) used for {date_format}; overwriting oldest log file: {}",
-                path.display()
+            logger_diagnostic(
+                tracing::Level::WARN,
+                &format!(
+                    "Max log ids ({MAX_ATTEMPTS}) used for {date_format}; overwriting oldest log file: {}",
+                    path.display()
+                ),
             );
             return Ok(path);
         }
@@ -339,7 +356,7 @@ where
             if data.current_day_of_month != now.day() {
                 drop(data);
                 if let Err(e) = self.rotate_log() {
-                    eprintln!("Failed to rotate log: {e}");
+                    logger_diagnostic(tracing::Level::ERROR, &format!("Failed to rotate log: {e}"));
                 }
             }
         }

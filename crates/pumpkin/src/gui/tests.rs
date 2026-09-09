@@ -74,9 +74,7 @@ fn shutdown_state_is_idempotent_without_cancelling_global_server() {
         Some("startup failed")
     );
     assert!(!failed.begin_stop());
-    let logs = failed.drain_logs();
-    assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].level, Level::ERROR);
+    assert!(failed.drain_logs().is_empty());
 }
 
 #[test]
@@ -85,14 +83,19 @@ fn snapshots_are_owned_copies_and_finish_clears_online_state() {
     {
         let mut snapshot = handle.state.snapshot.lock().unwrap();
         snapshot.players.push(GuiPlayer {
+            id: uuid::Uuid::from_u128(1),
             name: "Alex".to_string(),
             edition: "Java".to_string(),
+            is_op: true,
         });
         snapshot.tps = 20.0;
         snapshot.record_memory_sample(1234);
         snapshot.sample_id = 4;
     };
     let mut copy = handle.snapshot();
+    assert!(copy.players[0].is_op);
+    copy.players[0].is_op = false;
+    assert!(handle.snapshot().players[0].is_op);
     copy.players.clear();
     copy.memory_history.clear();
     assert_eq!(handle.snapshot().players.len(), 1);
@@ -225,8 +228,10 @@ fn managed_restart_resets_session_state_after_draining_old_commands() {
 
     let mut first = running_handle().snapshot();
     first.players.push(GuiPlayer {
+        id: uuid::Uuid::from_u128(1),
         name: "Alex".to_string(),
         edition: "Java".to_string(),
+        is_op: false,
     });
     first.record_memory_sample(1234);
     first.uptime = Duration::from_secs(42);
@@ -245,6 +250,7 @@ fn managed_restart_resets_session_state_after_draining_old_commands() {
     assert!(handle.submit_command("late old command").is_err());
     assert_eq!(commands.try_recv().unwrap(), "old command");
     assert!(commands.try_recv().is_err());
+    handle.push_log(Level::ERROR, "first backend failed");
     handle.finish(Some("first backend failed".to_string()));
     assert!(!*desired.borrow());
     assert_eq!(handle.snapshot().uptime, Duration::from_secs(42));
@@ -267,7 +273,9 @@ fn managed_restart_resets_session_state_after_draining_old_commands() {
     assert!(!second.commands_enabled);
     assert!(handle.submit_command("too early").is_err());
     assert!(handle.request_start().is_err());
-    assert_eq!(handle.drain_logs()[0].text, "first backend failed");
+    let logs = handle.drain_logs();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].text, "first backend failed");
 
     handle.apply_backend_update(running_handle().snapshot(), Vec::new());
     handle.submit_command("new command").unwrap();
@@ -394,8 +402,10 @@ fn snapshots_and_log_levels_round_trip_through_ipc_serialization() {
     snapshot.record_memory_sample(4096);
     snapshot.uptime = Duration::new(12, 345);
     snapshot.players.push(GuiPlayer {
+        id: uuid::Uuid::from_u128(1),
         name: "Alex".to_string(),
         edition: "Bedrock".to_string(),
+        is_op: true,
     });
     for level in [
         Level::TRACE,
@@ -417,6 +427,7 @@ fn snapshots_and_log_levels_round_trip_through_ipc_serialization() {
         assert_eq!(decoded.1[0].level, level);
         assert_eq!(decoded.0.uptime, snapshot.uptime);
         assert_eq!(decoded.0.memory_history, snapshot.memory_history);
+        assert!(decoded.0.players[0].is_op);
         assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
     }
     assert!(
@@ -425,4 +436,36 @@ fn snapshots_and_log_levels_round_trip_through_ipc_serialization() {
         )
         .is_err()
     );
+    assert!(
+        serde_json::from_str::<GuiPlayer>(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","name":"Alex","edition":"Java"}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn operator_membership_uses_current_config_uuids_not_names_or_levels() {
+    use pumpkin_config::op::Op;
+    use pumpkin_util::permission::PermissionLvl;
+
+    let id = uuid::Uuid::from_u128(1);
+    let other_id = uuid::Uuid::from_u128(2);
+    let mut ops = vec![Op::new(
+        id,
+        "Old Name".to_string(),
+        PermissionLvl::Zero,
+        false,
+    )];
+    assert_eq!(operator_ids(&ops), HashSet::from([id]));
+
+    ops[0].name = "New Name".to_string();
+    ops[0].level = PermissionLvl::Four;
+    assert_eq!(operator_ids(&ops), HashSet::from([id]));
+
+    // Reusing the old operator's name never grants membership to a different UUID.
+    ops[0].uuid = other_id;
+    assert_eq!(operator_ids(&ops), HashSet::from([other_id]));
+    ops.clear();
+    assert!(operator_ids(&ops).is_empty());
 }

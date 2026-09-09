@@ -3,7 +3,12 @@
     any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
 
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    net::{Ipv4Addr, SocketAddr, TcpListener},
+    path::PathBuf,
+    time::Duration,
+};
 
 use pumpkin::gui::{GuiHandle, ServerStatus, process::run_supervisor};
 use pumpkin_config::{LoadConfiguration, PumpkinConfig};
@@ -29,7 +34,7 @@ autosave_ticks = 0
 
 [networking.java]
 enabled = true
-address = "127.0.0.1:0"
+address = "{java_address}"
 encryption = false
 online_mode = false
 max_players = 8
@@ -76,13 +81,18 @@ struct ManagedServer {
 
 impl ManagedServer {
     fn new(use_console: bool) -> Result<Self, String> {
+        Self::with_java_address(use_console, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+    }
+
+    fn with_java_address(use_console: bool, java_address: SocketAddr) -> Result<Self, String> {
         let directory = tempfile::Builder::new()
             .prefix("pumpkin-gui-restart-")
             .tempdir()
             .map_err(|error| error.to_string())?;
+        let test_config = TEST_CONFIG.replace("{java_address}", &java_address.to_string());
         std::fs::write(
             directory.path().join("pumpkin.toml"),
-            format!("{TEST_CONFIG}\n[commands]\nuse_console = {use_console}\nuse_tty = false\n"),
+            format!("{test_config}\n[commands]\nuse_console = {use_console}\nuse_tty = false\n"),
         )
         .map_err(|error| error.to_string())?;
 
@@ -92,7 +102,7 @@ impl ManagedServer {
         let networking = &config.advanced.networking;
         if !networking.java.enabled
             || !networking.java.address.ip().is_loopback()
-            || networking.java.address.port() != 0
+            || networking.java.address != java_address
             || networking.java.online_mode
             || networking.java.max_players != 8
             || networking.bedrock.enabled
@@ -299,5 +309,86 @@ async fn managed_gui_stop_works_when_console_commands_are_disabled() -> Result<(
     })
     .await
     .unwrap_or_else(|_| Err("Timed out exercising Stop with console disabled.".into()));
+    server.finish(result).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_gui_keeps_startup_failure_logs_and_can_retry() -> Result<(), String> {
+    let occupied =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|error| error.to_string())?;
+    let address = occupied.local_addr().map_err(|error| error.to_string())?;
+    let mut server = ManagedServer::with_java_address(true, address)?;
+    let result = timeout(CASE_TIMEOUT, async {
+        server
+            .wait_for("startup failure without Running", |server| {
+                matches!(
+                    server.gui.snapshot().status,
+                    ServerStatus::Failed | ServerStatus::Running
+                )
+            })
+            .await?;
+        server.collect_logs();
+        if server.gui.snapshot().status != ServerStatus::Failed
+            || server
+                .logs
+                .iter()
+                .any(|line| line.contains("Server is now running."))
+        {
+            return Err("The backend reported Running despite its occupied Java port.".into());
+        }
+        let address_error = format!("Error: Address {address} is already in use.");
+        for expected in [
+            "Starting Pumpkin",
+            address_error.as_str(),
+            "Make sure another instance of the server isn't already running",
+        ] {
+            let count = server
+                .logs
+                .iter()
+                .filter(|line| line.contains(expected))
+                .count();
+            if count != 1 {
+                return Err(format!(
+                    "Expected one GUI startup failure log containing {expected:?}, found {count}."
+                ));
+            }
+        }
+        let summary = server
+            .gui
+            .snapshot()
+            .last_error
+            .ok_or("The startup failure lost its status error.")?;
+        if server.logs.iter().any(|line| line == &summary) {
+            return Err("The GUI added a failure summary to the server's console logs.".into());
+        }
+        if server.supervisor.is_finished() || server.gui.close_requested() {
+            return Err("A startup failure closed the managed GUI session.".into());
+        }
+
+        drop(occupied);
+        let retry_logs = server.logs.len();
+        server.gui.request_start()?;
+        server
+            .wait_for("Running after releasing the occupied port", |server| {
+                server.gui.snapshot().status == ServerStatus::Running
+            })
+            .await?;
+        server.list_players().await?;
+        server.gui.request_stop();
+        server.wait_for_stopped().await?;
+        server.collect_logs();
+        let rotations = server.logs[retry_logs..]
+            .iter()
+            .filter(|line| line.contains("Found existing log file at"))
+            .count();
+        if rotations != 1 {
+            return Err(format!(
+                "Expected one GUI log-rotation notice on retry, found {rotations}."
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|_| Err("Timed out exercising startup failure and retry.".into()));
     server.finish(result).await
 }

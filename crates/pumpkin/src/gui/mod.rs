@@ -1,8 +1,9 @@
 //! A bounded, toolkit-independent bridge between the server and its native GUI.
 
+pub mod player_actions;
 pub mod process;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -39,8 +40,14 @@ pub enum ServerStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GuiPlayer {
+    pub id: uuid::Uuid,
     pub name: String,
     pub edition: String,
+    pub is_op: bool,
+}
+
+fn operator_ids(ops: &[pumpkin_config::op::Op]) -> HashSet<uuid::Uuid> {
+    ops.iter().map(|op| op.uuid).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -447,16 +454,26 @@ impl GuiHandle {
     }
 
     fn update_snapshot(&self, server: &Server, memory_bytes: Option<u64>) {
+        let operators = {
+            let config = server
+                .data
+                .operator_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            operator_ids(&config.ops)
+        };
         let mut players: Vec<_> = server
             .get_all_players()
             .iter()
             .map(|player| GuiPlayer {
+                id: player.gameprofile.id,
                 name: sanitize_single_line(&player.gameprofile.name),
                 edition: match player.client.as_ref() {
                     ClientPlatform::Java(_) => "Java",
                     ClientPlatform::Bedrock(_) => "Bedrock",
                 }
                 .to_string(),
+                is_op: operators.contains(&player.gameprofile.id),
             })
             .collect();
         players.sort_unstable_by(|a, b| a.name.cmp(&b.name).then(a.edition.cmp(&b.edition)));
@@ -486,10 +503,8 @@ impl GuiHandle {
 
     /// Marks backend completion. Normal completion follows the save/shutdown sequence;
     /// an error reports backend failure and does not imply that saving completed.
+    /// Error summaries belong to the status display, not the server's console log.
     pub fn finish(&self, error: Option<String>) {
-        if let Some(error) = &error {
-            self.push_log(Level::ERROR, error);
-        }
         let mut snapshot = self
             .state
             .snapshot

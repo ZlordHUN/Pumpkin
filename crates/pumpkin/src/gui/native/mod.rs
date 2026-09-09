@@ -6,7 +6,9 @@ use pumpkin::gui::{
 };
 
 mod console;
+mod players;
 use console::ConsoleDocument;
+use players::{PLAYER_ROW_HEIGHT, PlayerControls};
 
 const BACKGROUND: Color32 = Color32::from_rgb(19, 21, 24);
 const SURFACE: Color32 = Color32::from_rgb(27, 30, 34);
@@ -20,9 +22,12 @@ const HISTORY_CAPACITY: usize = 64;
 const APP_ID: &str = "org.pumpkinmc.Pumpkin";
 
 pub fn run(handle: GuiHandle) -> eframe::Result {
-    let icon = image::load_from_memory(include_bytes!("../../../assets/default_icon.png"))
-        .ok()
-        .map(image::DynamicImage::into_rgba8);
+    let icon = image::load_from_memory(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/default_icon.png"
+    )))
+    .ok()
+    .map(image::DynamicImage::into_rgba8);
     let mut viewport = egui::ViewportBuilder::default()
         // Wayland desktops resolve the taskbar icon through the matching .desktop entry.
         .with_app_id(APP_ID)
@@ -61,6 +66,7 @@ pub fn run(handle: GuiHandle) -> eframe::Result {
                 history: CommandHistory::default(),
                 command: String::new(),
                 command_error: None,
+                player_controls: PlayerControls::default(),
                 close_when_stopped: false,
             }))
         }),
@@ -102,6 +108,7 @@ struct ServerApp {
     history: CommandHistory,
     command: String,
     command_error: Option<String>,
+    player_controls: PlayerControls,
     close_when_stopped: bool,
 }
 
@@ -133,7 +140,7 @@ impl eframe::App for ServerApp {
                         egui::Layout::top_down(Align::LEFT),
                         |ui| {
                             ui.set_width(sidebar_width);
-                            Self::sidebar(ui, &snapshot);
+                            self.sidebar(ui, &snapshot);
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -143,6 +150,15 @@ impl eframe::App for ServerApp {
                     );
                 });
             });
+        if let Some(result) = self.player_controls.process_actions(ui.ctx(), &self.handle) {
+            match result {
+                Ok(command) => {
+                    self.history.record(command);
+                    self.command_error = None;
+                }
+                Err(error) => self.command_error = Some(error),
+            }
+        }
     }
 }
 
@@ -175,7 +191,7 @@ impl ServerApp {
         });
     }
 
-    fn sidebar(ui: &mut egui::Ui, snapshot: &ServerSnapshot) {
+    fn sidebar(&mut self, ui: &mut egui::Ui, snapshot: &ServerSnapshot) {
         ui.spacing_mut().item_spacing.y = 6.0;
         ui.spacing_mut().interact_size.y = 18.0;
         card().show(ui, |ui| {
@@ -235,6 +251,10 @@ impl ServerApp {
             }
         });
         ui.add_space(4.0);
+        self.player_list(ui, snapshot);
+    }
+
+    fn player_list(&mut self, ui: &mut egui::Ui, snapshot: &ServerSnapshot) {
         let height = ui.available_height().max(76.0);
         card().show(ui, |ui| {
             ui.set_min_size(Vec2::new(ui.available_width(), (height - 30.0).max(46.0)));
@@ -256,24 +276,27 @@ impl ServerApp {
                 ui.add_space(6.0);
                 ui.label(RichText::new("No players online").color(MUTED));
             } else {
-                ui.spacing_mut().interact_size.y = 22.0;
+                ui.spacing_mut().interact_size.y = PLAYER_ROW_HEIGHT;
                 egui::ScrollArea::vertical()
                     .id_salt("players")
                     .max_height((height - 64.0).max(24.0))
-                    .show_rows(ui, 22.0, snapshot.players.len(), |ui, range| {
-                        for index in range {
-                            let player = &snapshot.players[index];
-                            ui.horizontal(|ui| {
-                                status_dot(ui, GREEN);
-                                ui.add(egui::Label::new(&player.name).truncate());
-                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(
-                                        RichText::new(&player.edition).size(11.0).color(MUTED),
-                                    );
-                                });
-                            });
-                        }
-                    });
+                    .show_rows(
+                        ui,
+                        PLAYER_ROW_HEIGHT,
+                        snapshot.players.len(),
+                        |ui, range| {
+                            for index in range {
+                                let player = &snapshot.players[index];
+                                self.player_controls.show_player(
+                                    ui,
+                                    player,
+                                    snapshot.status == ServerStatus::Running
+                                        && snapshot.commands_enabled
+                                        && !self.close_when_stopped,
+                                );
+                            }
+                        },
+                    );
             }
         });
     }
@@ -528,12 +551,6 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(10.0).strong().color(MUTED));
 }
 
-// Paint indicators instead of relying on symbol glyphs in the bundled fonts.
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 14.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 3.0, color);
-}
-
 fn detail_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).size(12.0).color(MUTED));
@@ -728,9 +745,12 @@ mod tests {
         ] {
             assert!(entry.lines().any(|line| line == expected));
         }
-        let icon = image::load_from_memory(include_bytes!("../../../assets/default_icon.png"))
-            .expect("embedded Pumpkin icon")
-            .into_rgba8();
+        let icon = image::load_from_memory(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/default_icon.png"
+        )))
+        .expect("embedded Pumpkin icon")
+        .into_rgba8();
         assert_eq!(icon.dimensions(), (64, 64));
         assert!(icon.pixels().any(|pixel| pixel[3] > 0));
     }
@@ -830,6 +850,7 @@ mod tests {
             history: CommandHistory::default(),
             command: String::new(),
             command_error: None,
+            player_controls: PlayerControls::default(),
             close_when_stopped: false,
         };
         let input = egui::RawInput {
@@ -1032,7 +1053,7 @@ mod tests {
         let context = egui::Context::default();
         configure_style(&context);
         let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-            status_dot(ui, GREEN);
+            server_controls(ui, ServerStatus::Running, false);
             ui.fonts_mut(|fonts| {
                 for status in [
                     ServerStatus::Starting,

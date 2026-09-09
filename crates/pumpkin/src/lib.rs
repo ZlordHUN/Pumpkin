@@ -268,7 +268,7 @@ impl PumpkinServer {
         advanced_config: AdvancedConfiguration,
         telemetry_config: TelemetryConfig,
         vanilla_data: VanillaData,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let server = Server::new(
             basic_config,
             advanced_config,
@@ -297,26 +297,29 @@ impl PumpkinServer {
             // Setup the TCP server socket.
             let listener = match TcpListener::bind(address).await {
                 Ok(l) => l,
-                Err(e) => match e.kind() {
-                    ErrorKind::AddrInUse => {
-                        error!("Error: Address {address} is already in use.");
-                        error!("Make sure another instance of the server isn't already running");
-                        std::process::exit(1);
+                Err(e) => {
+                    match e.kind() {
+                        ErrorKind::AddrInUse => {
+                            error!("Error: Address {address} is already in use.");
+                            error!(
+                                "Make sure another instance of the server isn't already running"
+                            );
+                        }
+                        ErrorKind::PermissionDenied => {
+                            error!("Error: Permission denied when binding to {address}.");
+                            error!("You might need sudo/admin privileges to use ports below 1024");
+                        }
+                        ErrorKind::AddrNotAvailable => {
+                            error!("Error: The address {address} is not available on this machine");
+                        }
+                        _ => {
+                            error!("Failed to start TcpListener on {address}: {e}");
+                        }
                     }
-                    ErrorKind::PermissionDenied => {
-                        error!("Error: Permission denied when binding to {address}.");
-                        error!("You might need sudo/admin privileges to use ports below 1024");
-                        std::process::exit(1);
-                    }
-                    ErrorKind::AddrNotAvailable => {
-                        error!("Error: The address {address} is not available on this machine");
-                        std::process::exit(1);
-                    }
-                    _ => {
-                        error!("Failed to start TcpListener on {address}: {e}");
-                        std::process::exit(1);
-                    }
-                },
+                    // Let the launcher finish reporting the error before exiting.
+                    // Do not save a world another server may already have open.
+                    return Err(e);
+                }
             };
             // In the event the user puts 0 for their port, this will allow us to know what port it is running on
             let addr = listener.local_addr().unwrap_or_else(|_| {
@@ -356,19 +359,19 @@ impl PumpkinServer {
                 })
             {
                 error!("Failed to spawn Server-Ticker thread: {err}");
-                std::process::exit(1);
+                return Err(err);
             }
         };
 
         let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
         let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
 
-        Self {
+        Ok(Self {
             server,
             tcp_listener,
             bedrock_status,
             nethernet_listener,
-        }
+        })
     }
 
     async fn bind_nethernet(

@@ -7,10 +7,12 @@
 compile_error!("Compiling for WASI targets is not supported!");
 
 mod cli;
+// Keep desktop rendering in the executable, with its source alongside the GUI bridge.
 #[cfg(all(
     feature = "gui",
     any(target_os = "linux", target_os = "windows", target_os = "macos")
 ))]
+#[path = "gui/native/mod.rs"]
 mod native_gui;
 
 use pumpkin_data::packet::CURRENT_MC_VERSION;
@@ -172,6 +174,7 @@ fn run_desktop(runtime: &tokio::runtime::Runtime) {
             Err(_) => Some("The server supervisor encountered a fatal error.".to_owned()),
         };
         if let Some(error) = error {
+            supervisor_gui.push_log(tracing::Level::ERROR, &error);
             supervisor_gui.finish(Some(error));
             SERVER_EXIT_CODE.store(1, Ordering::Release);
         }
@@ -330,13 +333,19 @@ async fn run_server() {
         }
     });
 
-    let pumpkin_server = PumpkinServer::new(
+    let Ok(pumpkin_server) = PumpkinServer::new(
         config.basic,
         config.advanced,
         config.telemetry,
         vanilla_data,
     )
-    .await;
+    .await
+    else {
+        // Startup already logged the detailed cause. In GUI mode, return
+        // through run_gui_backend so its final log batch is sent before exit.
+        SERVER_EXIT_CODE.store(1, Ordering::Release);
+        return;
+    };
     let plugin_wait_time = pumpkin_server.init_plugins().await;
 
     let time_elapsed = time.elapsed().saturating_sub(plugin_wait_time);

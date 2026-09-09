@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::{GuiHandle, LogLine, ServerSnapshot, ServerStatus};
 
 const CHANNEL_ENV: &str = "PUMPKIN_GUI_CHANNEL";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 3;
 const MAX_FRAME_BYTES: usize = 1_024 * 1_024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -97,7 +97,16 @@ pub async fn run_supervisor(
         gui.request_stop();
         drain_commands(&mut commands);
         match result {
-            Ok(error) => gui.finish(error),
+            Ok(error) => {
+                // Backend failure summaries are already shown in the status display.
+                // Only add diagnostics originating from the supervisor itself.
+                if let Some(error) = &error
+                    && gui.snapshot().last_error.as_ref() != Some(error)
+                {
+                    gui.push_log(Level::ERROR, error);
+                }
+                gui.finish(error);
+            }
             Err(error) => {
                 // A failed OS wait cannot prove that the child was reaped.
                 gui.push_log(
